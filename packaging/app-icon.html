@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    html, body { margin: 0; width: 1024px; height: 1024px; overflow: hidden; }
+    .icon {
+      width: 1024px; height: 1024px;
+      background: radial-gradient(circle at 30% 20%, #1a3a4a, #071018 70%);
+      display: grid;
+      place-items: center;
+    }
+    .mark {
+      width: 620px; height: 620px;
+      border-radius: 140px;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 18px solid rgba(60, 239, 255, 0.55);
+      box-shadow: 0 0 80px rgba(60, 239, 255, 0.35);
+    }
+    .mark span:first-child { background: #3cefff; }
+    .mark span:last-child { background: #10212c; }
+  </style>
+</head>
+<body>
+  <div class="icon"><div class="mark"><span></span><span></span></div></div>
+</body>
+</html>

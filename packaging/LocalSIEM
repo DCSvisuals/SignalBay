@@ -1,0 +1,121 @@
+#!/bin/bash
+# Clickable LocalSIEM.app entry point.
+set -euo pipefail
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+ROOT="/Users/david/Desktop/CyberNews"
+API="http://127.0.0.1:3001/api/health"
+UI_5173="http://127.0.0.1:5173"
+UI_5174="http://127.0.0.1:5174"
+SUPPORT="$HOME/Library/Application Support/LocalSIEM"
+SKIP_FDA="$SUPPORT/skip-fda-prompt"
+NODE="/opt/homebrew/bin/node"
+APP_PATH="/Users/david/Desktop/LocalSIEM.app"
+
+mkdir -p "$SUPPORT"
+
+has_full_disk_access() {
+  ls "/Library/Application Support/com.apple.TCC" >/dev/null 2>&1
+}
+
+open_full_disk_settings() {
+  open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles" 2>/dev/null \
+    || open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null \
+    || open "/System/Library/PreferencePanes/Security.prefPane"
+}
+
+prompt_full_disk_access() {
+  if has_full_disk_access; then
+    return 0
+  fi
+  if [[ -f "$SKIP_FDA" ]]; then
+    return 0
+  fi
+
+  local choice
+  choice="$(osascript <<EOF
+try
+  set theButton to button returned of (display dialog "LocalSIEM can read more of this Mac if Full Disk Access is turned on.
+
+macOS will not grant this by itself. Add these in System Settings → Privacy & Security → Full Disk Access, then turn each switch on:
+
+• Terminal — recommended (this is what actually runs LocalSIEM)
+• LocalSIEM — optional (this app icon)
+  $APP_PATH
+• node — optional
+  $NODE
+
+Quit Terminal completely (⌘Q) and open LocalSIEM again after you change the switches.
+
+This does not silence Apple XProtect / sandboxd lines." buttons {"Skip for now", "Don't ask again", "Open Full Disk Access"} default button "Open Full Disk Access" with title "LocalSIEM needs Full Disk Access" with icon caution)
+  return theButton
+on error
+  return "Skip for now"
+end try
+EOF
+)" || choice="Skip for now"
+
+  case "$choice" in
+    "Open Full Disk Access")
+      open_full_disk_settings
+      osascript <<'EOF' >/dev/null 2>&1 || true
+display dialog "Add Terminal (recommended), LocalSIEM (optional), and node (optional), turn the switches on, then quit Terminal and open LocalSIEM again." buttons {"OK"} default button "OK" with title "Full Disk Access" with icon note
+EOF
+      ;;
+    "Don't ask again")
+      : >"$SKIP_FDA"
+      ;;
+  esac
+}
+
+ensure_homebrew_node() {
+  if [[ -x "$NODE" ]]; then
+    return 0
+  fi
+
+  local choice
+  choice="$(osascript <<EOF
+try
+  set theButton to button returned of (display dialog "Node is not installed at:
+$NODE
+
+LocalSIEM will install Homebrew (the macOS package manager) from the official Homebrew script, then install Node at that path.
+
+You may be asked for your Mac password in Terminal.
+
+When it finishes, choose Quit and Open so LocalSIEM restarts with Node." buttons {"Cancel", "Install Homebrew and Node"} default button "Install Homebrew and Node" with title "LocalSIEM needs Homebrew for Node" with icon caution)
+  return theButton
+on error
+  return "Cancel"
+end try
+EOF
+)" || choice="Cancel"
+
+  if [[ "$choice" != "Install Homebrew and Node" ]]; then
+    osascript <<'EOF' >/dev/null 2>&1 || true
+display dialog "LocalSIEM cannot start without Node at /opt/homebrew/bin/node." buttons {"OK"} default button "OK" with title "LocalSIEM" with icon stop
+EOF
+    exit 1
+  fi
+
+  chmod +x /Users/david/Desktop/CyberNews/scripts/bootstrap_node.sh /Users/david/Desktop/CyberNews/scripts/bootstrap_node.command 2>/dev/null || true
+  open -a Terminal /Users/david/Desktop/CyberNews/scripts/bootstrap_node.command
+  exit 0
+}
+
+open_dashboard() {
+  if curl -sf "$UI_5174" >/dev/null 2>&1; then
+    open "$UI_5174"
+  elif curl -sf "$UI_5173" >/dev/null 2>&1; then
+    open "$UI_5173"
+  else
+    open "$UI_5174"
+  fi
+}
+
+ensure_homebrew_node
+prompt_full_disk_access
+
+chmod +x /Users/david/Desktop/CyberNews/LocalSIEM.command /Users/david/Desktop/CyberNews/start_platform.sh 2>/dev/null || true
+xattr -d com.apple.quarantine /Users/david/Desktop/CyberNews/LocalSIEM.command /Users/david/Desktop/CyberNews/start_platform.sh 2>/dev/null || true
+open -a Terminal /Users/david/Desktop/CyberNews/LocalSIEM.command
