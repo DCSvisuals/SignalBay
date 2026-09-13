@@ -11,3 +11,4 @@ client/dist/
 coverage/
 .run/
 llm-keys.json
+.aider*
