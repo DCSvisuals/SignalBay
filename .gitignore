@@ -12,3 +12,5 @@ coverage/
 .run/
 llm-keys.json
 .aider*
+__pycache__/
+*.pyc

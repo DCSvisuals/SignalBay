@@ -1,4 +1,4 @@
-# Shared burst sender for LocalSIEM. Sourced, not executed.
+# Shared burst sender for Signalbay. Sourced, not executed.
 # shellcheck shell=bash
 
 HOST="${SYSLOG_HOST:-192.168.2.59}"
@@ -88,7 +88,7 @@ run_bursts() {
   local port="${2:-$(default_port "$proto")}"
   local started now elapsed burst_no=0
   local total=$((DURATION / INTERVAL))
-  echo "LocalSIEM $proto burst → ${HOST}:${port}"
+  echo "Signalbay $proto burst → ${HOST}:${port}"
   echo "${BURST} packets every ${INTERVAL}s for ${DURATION}s (${total} bursts)."
   echo "Live Dashboard, not Demo. Ctrl+C to stop."
   echo

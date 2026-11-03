@@ -10,6 +10,11 @@ const FALLBACK_OPTIONS: LlmOption[] = [
   { id: "local-qwen-14b", mode: "local", provider: "local", family: "qwen", label: "qwen 2.5-14b (32 GB RAM)", model: "qwen2.5-14b-instruct-q4_k_m.gguf" },
   { id: "local-phi-3.5", mode: "local", provider: "local", family: "phi", label: "Phi-3.5-mini (8 GB RAM)", model: "Phi-3.5-mini-instruct-Q4_K_M.gguf" },
   { id: "local-mistral-7b", mode: "local", provider: "local", family: "mistral", label: "Mistral 7b (16 GB RAM)", model: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf" },
+  { id: "mlx-qwen-3b", mode: "local", provider: "local", family: "mlx", runtime: "mlx", label: "MLX Qwen 2.5 3B 4-bit", model: "mlx-community__Qwen2.5-3B-Instruct-4bit" },
+  { id: "mlx-qwen-7b", mode: "local", provider: "local", family: "mlx", runtime: "mlx", label: "MLX Qwen 2.5 7B 4-bit", model: "mlx-community__Qwen2.5-7B-Instruct-4bit" },
+  { id: "mlx-llama-3b", mode: "local", provider: "local", family: "mlx", runtime: "mlx", label: "MLX Llama 3.2 3B 4-bit", model: "mlx-community__Llama-3.2-3B-Instruct-4bit" },
+  { id: "mlx-phi-3.5", mode: "local", provider: "local", family: "mlx", runtime: "mlx", label: "MLX Phi-3.5 mini 4-bit", model: "mlx-community__Phi-3.5-mini-instruct-4bit" },
+  { id: "mlx-mistral-7b", mode: "local", provider: "local", family: "mlx", runtime: "mlx", label: "MLX Mistral 7B 4-bit", model: "mlx-community__Mistral-7B-Instruct-v0.3-4bit" },
   { id: "cloud-anthropic", mode: "cloud", provider: "anthropic", family: "cloud", label: "Claude", model: "claude-sonnet-4-5" },
   { id: "cloud-openai", mode: "cloud", provider: "openai", family: "cloud", label: "ChatGPT", model: "gpt-4o" },
   { id: "cloud-google", mode: "cloud", provider: "google", family: "cloud", label: "Gemini", model: "gemini-2.0-flash" },
@@ -21,6 +26,7 @@ const GROUPS: Array<{ family: string; label: string }> = [
   { family: "phi", label: "Local LLMs: Phi" },
   { family: "mistral", label: "Local LLMs: Mistral Instruct" },
   { family: "other-local", label: "Local LLMs: Other GGUF" },
+  { family: "mlx", label: "Local LLMs: MLX" },
   { family: "cloud", label: "Cloud LLMs" }
 ];
 
@@ -36,6 +42,8 @@ export function TopBar({ connected, stats, llm, onRefresh }: Props) {
   const [busy, setBusy] = useState(false);
   const [showKeys, setShowKeys] = useState(false);
   const [openMenu, setOpenMenu] = useState(false);
+  const [addSource, setAddSource] = useState("");
+  const [addError, setAddError] = useState("");
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -98,6 +106,28 @@ export function TopBar({ connected, stats, llm, onRefresh }: Props) {
   const selected = options.find((item) => item.id === selectedId) ?? options[0];
   const downloadingId = llm?.downloadingId ?? null;
 
+  const addModel = async () => {
+    const source = addSource.trim();
+    if (!source) return;
+    setBusy(true);
+    setAddError("");
+    try {
+      await api.importLlm(source);
+      setAddSource("");
+      onRefresh();
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : "Could not add that model";
+      try {
+        const parsed = JSON.parse(raw) as { error?: string };
+        setAddError(parsed.error || raw);
+      } catch {
+        setAddError(raw);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const downloadModel = async (event: ReactMouseEvent, id: string) => {
     event.stopPropagation();
     setBusy(true);
@@ -117,7 +147,7 @@ export function TopBar({ connected, stats, llm, onRefresh }: Props) {
           <span />
         </div>
         <div>
-          <div className="wordmark">LocalSIEM</div>
+          <div className="wordmark">Signalbay</div>
           <div className="tagline">macOS Web-SIEM · Apple Silicon · offline</div>
         </div>
       </div>
@@ -136,7 +166,7 @@ export function TopBar({ connected, stats, llm, onRefresh }: Props) {
         </span>
         <span className={`pill ${llm?.mode === "cloud" ? "cloud" : llm?.metal || llm?.state === "ready" ? "metal" : ""}`}>
           <Cpu size={12} />
-          {llm?.mode === "cloud" ? "Cloud" : llm?.metal ? "Metal GPU" : llm?.gpu ?? "GPU"}
+          {llm?.mode === "cloud" ? "Cloud" : llm?.gpu === "mlx" ? "MLX" : llm?.metal ? "Metal GPU" : llm?.gpu ?? "GPU"}
           {llm?.state ? ` · ${llm.state}` : ""}
         </span>
         <span className="pill">
@@ -151,7 +181,12 @@ export function TopBar({ connected, stats, llm, onRefresh }: Props) {
             type="button"
             className="llm-trigger"
             disabled={busy}
-            onClick={() => setOpenMenu((v) => !v)}
+            onClick={() => {
+              setOpenMenu((open) => {
+                if (!open) onRefresh();
+                return !open;
+              });
+            }}
           >
             <span>{selected?.label ?? "Select"}</span>
             <ChevronDown size={12} />
@@ -184,7 +219,7 @@ export function TopBar({ connected, stats, llm, onRefresh }: Props) {
                           <button
                             type="button"
                             className="llm-dl"
-                            title={cached ? "Already downloaded" : "Download this GGUF"}
+                            title={cached ? "Already downloaded" : item.runtime === "mlx" ? "Download this MLX model" : "Download this GGUF"}
                             disabled={cached || pulling || busy}
                             onClick={(event) => {
                               if (cached) {
@@ -208,6 +243,29 @@ export function TopBar({ connected, stats, llm, onRefresh }: Props) {
                   })}
                 </div>
               ))}
+              <form
+                className="llm-add"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void addModel();
+                }}
+              >
+                <label htmlFor="llm-add-source">Add a local model</label>
+                <div>
+                  <input
+                    id="llm-add-source"
+                    value={addSource}
+                    placeholder="GGUF path, MLX folder, or Hugging Face model"
+                    onChange={(event) => setAddSource(event.target.value)}
+                  />
+                  <button type="submit" disabled={busy || !addSource.trim()}>
+                    Add
+                  </button>
+                </div>
+                <p className={addError ? "err" : ""}>
+                  {addError || "GGUF file (50 MB or larger), an MLX folder, or a Hugging Face model such as mlx-community/Qwen2.5-3B-Instruct-4bit."}
+                </p>
+              </form>
             </div>
           )}
         </div>

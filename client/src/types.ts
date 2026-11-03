@@ -17,6 +17,7 @@ export function isLogTransport(value: unknown): value is LogTransport {
 export interface LogEvent {
   id: number;
   receivedAt: string;
+  eventTime?: string;
   facility: number | null;
   severity: number | null;
   severityLabel: SeverityLabel;
@@ -26,6 +27,10 @@ export interface LogEvent {
   message: string;
   raw: string;
   sourceIp: string | null;
+  srcIp?: string | null;
+  userName?: string | null;
+  category?: string | null;
+  action?: string | null;
   parsed: Record<string, unknown>;
   hash: string;
   origin?: EventOrigin;
@@ -47,6 +52,16 @@ export interface Incident {
   origin?: EventOrigin;
   mitre?: Array<{ id: string; tactic: string; technique: string }>;
   occurrenceCount?: number;
+  assignee?: string | null;
+  closeReason?: string | null;
+}
+
+export interface CaseNote {
+  id: number;
+  incidentId: number;
+  createdAt: string;
+  author: string;
+  body: string;
 }
 
 export interface IocRecord {
@@ -55,6 +70,7 @@ export interface IocRecord {
   value: string;
   note: string | null;
   createdAt: string;
+  expiresAt?: string | null;
 }
 
 export interface ReportSummary {
@@ -95,6 +111,7 @@ export interface NewsItem {
 
 export type LlmMode = "local" | "cloud";
 export type LlmProvider = "local" | "openai" | "anthropic" | "google" | "xai";
+export type LlmRuntime = "gguf" | "mlx";
 
 export interface LlmOption {
   id: string;
@@ -106,6 +123,7 @@ export interface LlmOption {
   hfFile?: string;
   hfUri?: string;
   family?: string;
+  runtime?: LlmRuntime;
   cached?: boolean;
 }
 
@@ -138,6 +156,9 @@ export interface FimRecord {
   previousHash: string | null;
   updatedAt: string;
   origin: EventOrigin;
+  size?: number | null;
+  mode?: string | null;
+  mtime?: string | null;
 }
 
 export interface InventoryItem {
@@ -155,6 +176,8 @@ export interface InventoryHit {
   cve: string;
   title: string;
   collectedAt: string;
+  confidence?: "high" | "medium";
+  installedVersion?: string | null;
 }
 
 export interface ResponseAction {

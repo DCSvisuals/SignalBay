@@ -70,7 +70,7 @@ export function renderHealthPage(input: {
 }): string {
   const llmEnglish = describeLlm(input.llm);
   const arch = input.arch === "arm64" ? "Apple Silicon (arm64)" : input.arch;
-  const status = input.ok ? "LocalSIEM is running." : "LocalSIEM reported a problem.";
+  const status = input.ok ? "Signalbay is running." : "Signalbay reported a problem.";
   const dashboard = input.dashboardUrl || "http://127.0.0.1:5173";
 
   const rows: Array<[string, string]> = [
@@ -101,7 +101,7 @@ export function renderHealthPage(input: {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>LocalSIEM status</title>
+  <title>Signalbay status</title>
   <style>
     :root {
       --bg: #070b10;
@@ -176,7 +176,7 @@ export function renderHealthPage(input: {
 </head>
 <body>
   <main>
-    <p class="kicker">LocalSIEM · health check</p>
+    <p class="kicker">Signalbay · health check</p>
     <h1>System status</h1>
     <p class="lede">This page is the same health check the dashboard uses, written in plain English. Programs can still read the raw JSON.</p>
     <div class="pill ${input.ok ? "" : "down"}">${input.ok ? "Healthy" : "Unhealthy"}</div>

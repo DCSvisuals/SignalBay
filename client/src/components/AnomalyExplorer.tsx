@@ -57,7 +57,7 @@ export function AnomalyExplorer({
           <p>
             {demoMode
               ? "Incidents from demo logs only — isolated from real SIEM traffic."
-              : "Incidents from real UDP syslog only — isolated from demo traffic."}
+              : "Incidents from live collectors — isolated from demo traffic."}
           </p>
           <p>
             The Live Log Stream shows every syslog. This list only shows rows that

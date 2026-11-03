@@ -10,7 +10,7 @@ export function peerIp(addr?: string): string {
   return addr.replace(/^::ffff:/, "");
 }
 
-export function ensureTlsMaterial(): { key: Buffer; cert: Buffer; certPath: string } {
+export function ensureTlsMaterial(): { key: Buffer; cert: Buffer; certPath: string; ca?: Buffer } {
   ensureAppSupport();
   const keyPath = path.join(APP_SUPPORT, "syslog-tls.key");
   const certPath = path.join(APP_SUPPORT, "syslog-tls.crt");
@@ -30,17 +30,22 @@ export function ensureTlsMaterial(): { key: Buffer; cert: Buffer; certPath: stri
         "3650",
         "-nodes",
         "-subj",
-        "/CN=LocalSIEM-syslog"
+        "/CN=Signalbay-syslog"
       ],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
     fs.chmodSync(keyPath, 0o600);
     console.log(`[collector] TLS cert written to ${certPath}`);
   }
+  const caPath = process.env.TLS_CLIENT_CA;
+  const ca = caPath && fs.existsSync(caPath) ? fs.readFileSync(caPath) : undefined;
+  if (ca) console.log(`[collector] TLS client certificates required (${caPath})`);
+  else console.log("[collector] TLS syslog is lab mode: client certificates are not required");
   return {
     key: fs.readFileSync(keyPath),
     cert: fs.readFileSync(certPath),
-    certPath
+    certPath,
+    ca
   };
 }
 
@@ -184,16 +189,18 @@ export function bindNet(port: number, onSocket: (socket: net.Socket) => void): P
 
 export function bindTls(
   port: number,
-  material: { key: Buffer; cert: Buffer },
+  material: { key: Buffer; cert: Buffer; ca?: Buffer },
   onSocket: (socket: tls.TLSSocket) => void
 ): Promise<tls.Server> {
   return new Promise((resolve, reject) => {
+    const clientAuth = Boolean(material.ca);
     const server = tls.createServer(
       {
         key: material.key,
         cert: material.cert,
-        requestCert: false,
-        rejectUnauthorized: false
+        ca: material.ca,
+        requestCert: clientAuth,
+        rejectUnauthorized: clientAuth
       },
       onSocket
     );

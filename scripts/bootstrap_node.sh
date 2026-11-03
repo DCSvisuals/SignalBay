@@ -20,7 +20,7 @@ draw() {
     "Homebrew:     $BREW" \
     "This Mac:     $(uname -m) $(sw_vers -productVersion 2>/dev/null || true)" \
     "$extra")"
-  tui_frame "$VERSION" "$pct" "$status" "$body" "Installing tools so LocalSIEM can start."
+  tui_frame "$VERSION" "$pct" "$status" "$body" "Installing tools so Signalbay can start."
 }
 
 quit_and_open() {
@@ -31,7 +31,7 @@ try
   set theButton to button returned of (display dialog "Homebrew and Node are ready at:
 $NODE
 
-LocalSIEM needs to quit and open again to use this Node install." buttons {"Later", "Quit and Open"} default button "Quit and Open" with title "LocalSIEM" with icon note)
+Signalbay needs to quit and open again to use this Node install." buttons {"Later", "Quit and Open"} default button "Quit and Open" with title "Signalbay" with icon note)
   return theButton
 on error
   return "Later"
@@ -66,7 +66,7 @@ if [[ ! -x "$BREW" ]]; then
 fi
 
 if [[ ! -x "$BREW" ]]; then
-  draw 0 "Homebrew install did not finish." "Open LocalSIEM again after Homebrew is installed."
+  draw 0 "Homebrew install did not finish." "Open Signalbay again after Homebrew is installed."
   sleep 3
   exit 1
 fi

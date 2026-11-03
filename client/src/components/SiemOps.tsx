@@ -1,5 +1,5 @@
 import { FileWarning, PackageSearch, ShieldBan } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { newsForCves } from "../lib/cveNews";
 import type { FimRecord, InventoryHit, NewsItem, ResponseAction } from "../types";
@@ -24,7 +24,11 @@ export function SiemOps({
   onResponseUpdate
 }: Props) {
   const pending = responses.filter((row) => row.status === "pending");
-  const executed = responses.filter((row) => row.status === "executed");
+  const decided = responses.filter((row) => row.status !== "pending").slice(0, 8);
+  const [pf, setPf] = useState<{ ready: boolean; detail: string } | null>(null);
+  useEffect(() => {
+    void api.pfStatus().then(setPf).catch(() => undefined);
+  }, [responses]);
   const [selectedHit, setSelectedHit] = useState<InventoryHit | null>(null);
   const [hitArticles, setHitArticles] = useState<NewsItem[]>([]);
   const [hitLoading, setHitLoading] = useState(false);
@@ -108,7 +112,10 @@ export function SiemOps({
                   title={`Open ${row.cve}`}
                 >
                   <span className="cve">{row.cve}</span>
-                  <span>{row.name}</span>
+                  <span>
+                    {row.name}
+                    {row.confidence ? ` · ${row.confidence}` : ""}
+                  </span>
                 </button>
               ))}
             </div>
@@ -118,12 +125,17 @@ export function SiemOps({
           <header className="panel-head">
             <div>
               <h2>Active Response</h2>
-              <p>Confirm before block / kill / quarantine</p>
+              <p>
+                {pf?.ready
+                  ? "pf anchor localsiem is loaded. Confirm before block, kill, or quarantine."
+                  : "A block is applied only when pf accepts the anchor. Confirm still asks first."}
+              </p>
             </div>
             <ShieldBan size={14} />
           </header>
           <div className="ops-list">
-            {pending.length === 0 && executed.length === 0 && (
+            {pf && !pf.ready && <pre className="pf-note">{pf.detail}</pre>}
+            {pending.length === 0 && decided.length === 0 && (
               <div className="empty compact">No pending actions.</div>
             )}
             {pending.map((row) => (
@@ -142,13 +154,16 @@ export function SiemOps({
                 </div>
               </div>
             ))}
-            {executed.map((row) => (
+            {decided.map((row) => (
               <div className="ops-action" key={`ex-${row.id}`}>
                 <div>
-                  <strong>{row.action.replace("_", " ")}</strong> {row.target}
-                  <pre>{row.output ?? "executed"}</pre>
+                  <strong>
+                    {row.status} · {row.action.replace("_", " ")}
+                  </strong>{" "}
+                  {row.target}
+                  <pre>{row.output ?? row.status}</pre>
                 </div>
-                {row.action === "block_ip" && (
+                {row.action === "block_ip" && row.status === "executed" && (
                   <div className="demo-controls">
                     <button className="ghost" onClick={() => void undo(row.id)}>
                       Undo

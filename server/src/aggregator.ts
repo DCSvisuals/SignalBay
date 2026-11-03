@@ -18,7 +18,7 @@ const XML_FALLBACKS = [
 
 const CVE_RE = /CVE-\d{4}-\d{4,7}/gi;
 const UA =
-  "LocalSIEM/1.0 (macOS; privacy-focused local SIEM; +http://127.0.0.1:5173)";
+  "Signalbay/1.0 (macOS; privacy-focused local SIEM; +http://127.0.0.1:5173)";
 
 interface KevVulnerability {
   cveID?: string;

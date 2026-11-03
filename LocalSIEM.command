@@ -1,5 +1,5 @@
 #!/bin/bash
-# Opened by LocalSIEM.app via Terminal. Do not use ./exec — macOS can
+# Opened by LocalSIEM.app (Signalbay) via Terminal. Do not use ./exec — macOS can
 # return "Operation not permitted" for scripts on Desktop.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 cd /Users/david/Desktop/CyberNews || {

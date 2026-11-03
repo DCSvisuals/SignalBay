@@ -1,4 +1,4 @@
-# LocalSIEM terminal UI helpers. Sourced, not executed.
+# Signalbay terminal UI helpers. Sourced, not executed.
 # shellcheck shell=bash
 
 TUI_CYAN=$'\033[38;5;87m'
@@ -51,7 +51,7 @@ tui_frame() {
   printf '\033[H'
   printf '%s' "$TUI_CYAN"
   printf '+--------------------------------------------------------------------------+\n'
-  printf '|  %sLocalSIEM%s  v%-6s   macOS Web-SIEM · localhost only           %s|\n' "$TUI_BOLD" "$TUI_RESET$TUI_CYAN" "$version" "$TUI_CYAN"
+  printf '|  %sSignalbay%s  v%-6s   macOS Web-SIEM · localhost only           %s|\n' "$TUI_BOLD" "$TUI_RESET$TUI_CYAN" "$version" "$TUI_CYAN"
   printf '+--------------------------------------------------------------------------+\n'
   printf '|  %s%s%s|\n' "$TUI_RESET" "$(tui_clip "$(tui_bar "$pct")" 70)" "$TUI_CYAN"
   printf '|  %s%s%s|\n' "$TUI_DIM" "$(tui_clip "$statustext" 70)" "$TUI_CYAN"
@@ -135,7 +135,7 @@ state = llm.get("state") or "idle"
 msg = (llm.get("message") or "")[:42]
 print(f"AI engine     {state} · {msg}")
 print(f"Clients       {h.get('clients', 0)} connected")
-print("Health        LocalSIEM is running." if h.get("ok") else "Health        problem reported")
+print("Health        Signalbay is running." if h.get("ok") else "Health        problem reported")
 PY
 )"
   if [[ -n "$out" ]]; then

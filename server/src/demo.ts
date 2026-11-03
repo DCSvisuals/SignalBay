@@ -30,7 +30,7 @@ const TEMPLATES: Array<() => string> = [
     JSON.stringify({
       timestamp: iso(),
       hostname: host(),
-      appName: "local-siem-sensor",
+      appName: "signalbay-sensor",
       severity: 4,
       facility: 1,
       message: `file quarantine event path=/Users/${user()}/Downloads/installer.dmg xattr=com.apple.quarantine`,

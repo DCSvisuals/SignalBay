@@ -3,21 +3,27 @@ import http from "node:http";
 import express from "express";
 import { WebSocketServer } from "ws";
 import { ThreatAggregator } from "./aggregator.js";
+import { backupDatabase, latestBackupAgeMs } from "./backup.js";
 import { hub } from "./bus.js";
 import { UdpCollector } from "./collector.js";
+import { loadCustomRules, saveCustomRules, type CustomRule } from "./customRules.js";
 import { SiemDatabase } from "./database.js";
 import { randomSyslog, startDemoStream } from "./demo.js";
 import { startFimWatch } from "./fim.js";
-import { startInventoryLoop } from "./inventory.js";
-import { LlmEngine } from "./llm.js";
-import { saveKeys, type CloudProvider } from "./llmKeys.js";
-import { DB_PATH } from "./paths.js";
-import { computerName } from "./host.js";
-import { executeResponse, undoResponse } from "./response.js";
-import { startMacSensor } from "./sensor.js";
 import { detectDashboardUrl, renderHealthPage, wantsHealthHtml } from "./healthPage.js";
-import type { EventOrigin, LogTransport, PlatformStats } from "./types.js";
-import { loadCustomRules, saveCustomRules, type CustomRule } from "./customRules.js";
+import { computerName } from "./host.js";
+import { startInventoryLoop } from "./inventory.js";
+import { invalidateIocCache, validateIoc } from "./iocs.js";
+import { LlmEngine } from "./llm.js";
+import { saveKeys } from "./llmKeys.js";
+import { isLoopback } from "./netguard.js";
+import { DB_PATH } from "./paths.js";
+import { executeResponse, pfTableStatus, undoResponse } from "./response.js";
+import { BUILTIN_DETECTIONS } from "./rules.js";
+import { startMacSensor } from "./sensor.js";
+import { ensureLanToken, getSettings, saveSettings } from "./settings.js";
+import { peerIp } from "./syslogNet.js";
+import type { EventOrigin, InventoryHit, LogTransport, PlatformStats } from "./types.js";
 import { isLogTransport, LOG_TRANSPORTS, SYSLOG_TRANSPORTS } from "./types.js";
 
 const HTTP_PORT = Number(process.env.PORT || 3001);
@@ -46,6 +52,10 @@ const demoStreaming: Record<LogTransport, boolean> = {
   host: false
 };
 
+function highConfidenceCves(hits: InventoryHit[]): string[] {
+  return hits.filter((hit) => hit.confidence === "high").map((hit) => hit.cve);
+}
+
 function stopDemo(transport?: LogTransport): void {
   const keys = transport ? [transport] : LOG_TRANSPORTS;
   for (const key of keys) {
@@ -57,6 +67,10 @@ function stopDemo(transport?: LogTransport): void {
 
 const db = new SiemDatabase();
 const llm = new LlmEngine();
+
+function audit(actor: string, action: string, detail: string): void {
+  void db.insertAudit(actor, action, detail).catch((err) => console.warn("[audit]", err));
+}
 const collector = new UdpCollector(db);
 const aggregator = new ThreatAggregator(db, llm, (cves) => collector.refreshKev(cves));
 
@@ -78,7 +92,7 @@ async function snapshot(): Promise<PlatformStats> {
     tcpPort: collector.ports.tcp,
     tlsPort: collector.ports.tls,
     relpPort: collector.ports.relp,
-    llm: llm.status,
+    llm: llm.listedStatus(),
     eps: Number(eventWindow.toFixed(2)),
     fimChanges: counts.fimChanges,
     inventoryHits: counts.inventoryHits,
@@ -101,11 +115,15 @@ async function main(): Promise<void> {
 
   const app = express();
   app.use(express.json({ limit: "1mb" }));
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    next();
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-SIEM-Token");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    if (HTTP_BIND !== "0.0.0.0") return next();
+    if (isLoopback(peerIp(req.socket.remoteAddress))) return next();
+    const token = req.header("x-siem-token") || "";
+    if (token && token === getSettings().lanToken) return next();
+    res.status(401).json({ error: "LAN token required" });
   });
   app.options("*", (_req, res) => res.sendStatus(204));
 
@@ -113,16 +131,17 @@ async function main(): Promise<void> {
     const dashboardUrl = await detectDashboardUrl();
     const payload = {
       ok: true,
-      platform: "LocalSIEM",
+      platform: "Signalbay",
       arch: process.arch,
       udpPort,
       tcpPort,
       tlsPort,
       relpPort,
       db: DB_PATH,
-      llm: llm.status,
+      llm: llm.listedStatus(),
       clients: hub.size,
-      dashboardUrl
+      dashboardUrl,
+      tlsClientAuth: Boolean(process.env.TLS_CLIENT_CA)
     };
     if (wantsHealthHtml(req)) {
       const counts = await db.counts();
@@ -143,13 +162,23 @@ async function main(): Promise<void> {
   });
 
   app.get("/api/llm", (_req, res) => {
-    res.json(llm.status);
+    res.json(llm.listedStatus());
   });
 
   app.post("/api/llm", async (req, res) => {
     const id = typeof req.body?.id === "string" ? req.body.id : "local-qwen";
     const status = await llm.select(id);
     res.json(status);
+  });
+
+  app.post("/api/llm/import", async (req, res) => {
+    const source = typeof req.body?.source === "string" ? req.body.source : "";
+    try {
+      res.json(await llm.importLocal(source));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not add that model";
+      res.status(400).json({ error: message });
+    }
   });
 
   app.post("/api/llm/download", async (req, res) => {
@@ -196,6 +225,9 @@ async function main(): Promise<void> {
         to: typeof req.query.to === "string" ? req.query.to : undefined,
         transport: typeof req.query.transport === "string" ? req.query.transport : undefined,
         app: typeof req.query.app === "string" ? req.query.app : undefined,
+        user: typeof req.query.user === "string" ? req.query.user : undefined,
+        srcIp: typeof req.query.src === "string" ? req.query.src : undefined,
+        category: typeof req.query.category === "string" ? req.query.category : undefined,
         origin
       })
     );
@@ -222,13 +254,20 @@ async function main(): Promise<void> {
     if (!value) return res.status(400).json({ error: "value required" });
     const kind = typeof req.body?.kind === "string" ? req.body.kind : "ip";
     const note = typeof req.body?.note === "string" ? req.body.note : null;
-    await db.upsertIoc(kind, value, note);
-    await db.insertAudit("operator", "ioc-add", `${kind} ${value}`);
+    const problem = validateIoc(kind, value);
+    if (problem) return res.status(400).json({ error: problem });
+    const days = Number(req.body?.expiresInDays);
+    const expiresAt = Number.isFinite(days) && days > 0 ? new Date(Date.now() + days * 86_400_000).toISOString() : null;
+    await db.upsertIoc(kind, value, note, expiresAt);
+    invalidateIocCache();
+    audit("operator", "ioc-add", `${kind} ${value}`);
     res.json(await db.listIocs());
   });
 
   app.delete("/api/iocs/:id", async (req, res) => {
     await db.deleteIoc(Number(req.params.id));
+    invalidateIocCache();
+    audit("operator", "ioc-delete", String(req.params.id));
     res.json(await db.listIocs());
   });
 
@@ -237,13 +276,103 @@ async function main(): Promise<void> {
   });
 
   app.put("/api/rules", (req, res) => {
-    const rules = Array.isArray(req.body) ? (req.body as CustomRule[]) : [];
-    res.json(saveCustomRules(rules));
+    try {
+      const rules = Array.isArray(req.body) ? (req.body as CustomRule[]) : [];
+      const saved = saveCustomRules(rules);
+      audit("operator", "rules-save", `${saved.length} rules`);
+      res.json(saved);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "invalid rules" });
+    }
+  });
+
+  app.get("/api/detections", (_req, res) => {
+    const disabled = new Set(getSettings().disabledRules);
+    res.json(BUILTIN_DETECTIONS.map((rule) => ({ ...rule, enabled: !disabled.has(rule.id) })));
+  });
+
+  app.put("/api/detections/:id", (req, res) => {
+    const id = req.params.id;
+    if (!BUILTIN_DETECTIONS.some((rule) => rule.id === id)) {
+      return res.status(404).json({ error: "unknown detection" });
+    }
+    const enabled = req.body?.enabled !== false;
+    const disabled = new Set(getSettings().disabledRules);
+    if (enabled) disabled.delete(id);
+    else disabled.add(id);
+    saveSettings({ disabledRules: [...disabled] });
+    audit("operator", "detection", `${id} ${enabled ? "enabled" : "disabled"}`);
+    res.json({ id, enabled });
+  });
+
+  app.get("/api/exceptions", (_req, res) => {
+    res.json(getSettings().exceptions);
+  });
+
+  app.put("/api/exceptions", (req, res) => {
+    try {
+      const saved = saveSettings({ exceptions: Array.isArray(req.body) ? req.body : [] });
+      audit("operator", "exceptions", `${saved.exceptions.length} rules`);
+      res.json(saved.exceptions);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "invalid exceptions" });
+    }
+  });
+
+  app.get("/api/settings", (_req, res) => {
+    const settings = getSettings();
+    res.json({
+      retentionDays: settings.retentionDays,
+      maxEvents: settings.maxEvents,
+      webhookUrl: settings.webhookUrl,
+      tlsClientAuth: Boolean(process.env.TLS_CLIENT_CA)
+    });
+  });
+
+  app.put("/api/settings", (req, res) => {
+    try {
+      const saved = saveSettings({
+        retentionDays: req.body?.retentionDays,
+        maxEvents: req.body?.maxEvents,
+        webhookUrl: typeof req.body?.webhookUrl === "string" ? req.body.webhookUrl : undefined
+      });
+      audit("operator", "settings", `retention ${saved.retentionDays}d`);
+      res.json({
+        retentionDays: saved.retentionDays,
+        maxEvents: saved.maxEvents,
+        webhookUrl: saved.webhookUrl
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "invalid settings" });
+    }
+  });
+
+  app.post("/api/backup", async (_req, res) => {
+    const file = await backupDatabase(db);
+    audit("operator", "backup", file);
+    res.json({ ok: true, file });
+  });
+
+  app.get("/api/audit", async (req, res) => {
+    res.json(await db.listAudit(Number(req.query.limit || 40)));
+  });
+
+  app.get("/api/entity", async (req, res) => {
+    const kind = req.query.kind === "user" || req.query.kind === "ip" ? req.query.kind : "host";
+    const value = typeof req.query.value === "string" ? req.query.value.trim() : "";
+    if (!value) return res.status(400).json({ error: "value required" });
+    const origin = req.query.origin === "demo" ? "demo" : "live";
+    res.json(await db.entityView(kind, value, origin));
+  });
+
+  app.get("/api/reports/series", async (req, res) => {
+    res.json(await db.reportSeries(Number(req.query.hours || 24)));
   });
 
   app.get("/api/reports/summary", async (req, res) => {
     const hours = Number(req.query.hours || 24);
-    const summary = await db.reportSummary(hours);
+    const settings = getSettings();
+    const summary = await db.reportSummary(hours, settings.retentionDays);
     res.json({
       ...summary,
       capabilities: {
@@ -255,29 +384,33 @@ async function main(): Promise<void> {
         soarConfirm: true,
         riskScoring: true,
         complianceExport: true,
-        rbacOptional: process.env.SIEM_AUTH === "1",
+        rbacOptional: false,
         retention: true,
         jsonIngest: true,
         customRules: true,
         enrichment: true,
         historicalHunt: true,
-        localLlm: true
+        localLlm: llm.status.state === "ready" || llm.status.cloudConfigured,
+        cases: true,
+        webhook: Boolean(settings.webhookUrl),
+        fimWatch: true,
+        versionedKev: true
       }
     });
   });
 
   app.get("/api/compliance", async (_req, res) => {
     const summary = await db.reportSummary(24);
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>LocalSIEM compliance snapshot</title>
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Signalbay compliance snapshot</title>
       <style>body{font-family:sans-serif;background:#111;color:#ddd;padding:24px} table{border-collapse:collapse} td,th{border:1px solid #444;padding:6px 10px}</style></head>
-      <body><h1>LocalSIEM lab compliance snapshot</h1>
+      <body><h1>Signalbay lab compliance snapshot</h1>
       <p>Not a PCI/HIPAA certification. Evidence pack for a home-lab control set (ISO 27001-inspired logging).</p>
       <table>
       <tr><th>Control</th><th>Status</th></tr>
       <tr><td>A.12.4 Logging</td><td>Events retained ${summary.retentionDays} days · ${summary.events} in last 24h</td></tr>
       <tr><td>A.16 Incident management</td><td>${summary.openIncidents} open · ${summary.highOpen} high/crit</td></tr>
       <tr><td>A.12.2 Malware / KEV</td><td>CISA KEV + inventory matching enabled</td></tr>
-      <tr><td>A.9 Access</td><td>${process.env.SIEM_AUTH === "1" ? "SIEM_AUTH on" : "localhost trust (set SIEM_AUTH=1 for login)"}</td></tr>
+      <tr><td>A.9 Access</td><td>Localhost trust. LAN bind requires the X-SIEM-Token header. No role system.</td></tr>
       </table>
       <p>Generated ${summary.generatedAt}</p></body></html>`;
     if (String(_req.headers.accept || "").startsWith("text/html")) {
@@ -374,10 +507,27 @@ async function main(): Promise<void> {
       res.status(400).json({ error: "status must be open, ack, or closed" });
       return;
     }
-    const updated = await db.updateIncidentStatus(Number(req.params.id), status);
+    const assignee = typeof req.body?.assignee === "string" ? req.body.assignee.slice(0, 80) : undefined;
+    const closeReason = typeof req.body?.closeReason === "string" ? req.body.closeReason.slice(0, 500) : undefined;
+    const updated = await db.updateIncidentCase(Number(req.params.id), { status, assignee, closeReason });
     if (!updated) return res.status(404).json({ error: "not found" });
+    audit("operator", "case-status", `${updated.id} ${status}`);
     hub.broadcast({ type: "incident", payload: updated });
     res.json(updated);
+  });
+
+  app.get("/api/incidents/:id/notes", async (req, res) => {
+    res.json(await db.listCaseNotes(Number(req.params.id)));
+  });
+
+  app.post("/api/incidents/:id/notes", async (req, res) => {
+    const body = typeof req.body?.body === "string" ? req.body.body.trim() : "";
+    if (!body) return res.status(400).json({ error: "note required" });
+    const incident = await db.getIncident(Number(req.params.id));
+    if (!incident) return res.status(404).json({ error: "not found" });
+    const note = await db.addCaseNote(incident.id, "operator", body.slice(0, 2000));
+    audit("operator", "case-note", `${incident.id}`);
+    res.json(note);
   });
 
   app.get("/api/fim", async (req, res) => {
@@ -392,9 +542,13 @@ async function main(): Promise<void> {
   app.post("/api/inventory/scan", async (_req, res) => {
     const { collectInventory } = await import("./inventory.js");
     const result = await collectInventory(db);
-    collector.refreshInventoryCves(result.hits.map((hit) => hit.cve));
+    collector.refreshInventoryCves(highConfidenceCves(result.hits));
     for (const hit of result.hits) hub.broadcast({ type: "inventory_hit", payload: hit });
     res.json({ items: result.items.length, hits: result.hits.length });
+  });
+
+  app.get("/api/response/pf", async (_req, res) => {
+    res.json(await pfTableStatus());
   });
 
   app.get("/api/response", async (req, res) => {
@@ -408,11 +562,13 @@ async function main(): Promise<void> {
     if (item.status !== "pending") return res.status(409).json({ error: "already decided" });
     if (req.body?.confirm !== true) {
       const denied = await db.updateResponse(item.id, "denied", "Operator denied");
+      audit("operator", "response-deny", `${item.action} ${item.target}`);
       if (denied) hub.broadcast({ type: "response", payload: denied });
       res.json(denied);
       return;
     }
     const result = await executeResponse(item);
+    audit("operator", "response-confirm", `${item.action} ${item.target} ${result.status}`);
     const updated = await db.updateResponse(item.id, result.status, result.output);
     if (updated) hub.broadcast({ type: "response", payload: updated });
     res.json(updated);
@@ -423,6 +579,7 @@ async function main(): Promise<void> {
     if (!item) return res.status(404).json({ error: "not found" });
     if (item.status !== "executed") return res.status(409).json({ error: "only executed actions can be undone" });
     const result = await undoResponse(item);
+    audit("operator", "response-undo", `${item.action} ${item.target} ${result.status}`);
     const updated = await db.updateResponse(item.id, result.status, result.output);
     if (updated) hub.broadcast({ type: "response", payload: updated });
     res.json(updated);
@@ -450,7 +607,14 @@ async function main(): Promise<void> {
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: "/ws" });
-  wss.on("connection", (socket) => {
+  wss.on("connection", (socket, req) => {
+    if (HTTP_BIND === "0.0.0.0" && !isLoopback(peerIp(req.socket.remoteAddress))) {
+      const token = new URL(req.url ?? "", "http://127.0.0.1").searchParams.get("token") || "";
+      if (token !== getSettings().lanToken) {
+        socket.close(1008, "token");
+        return;
+      }
+    }
     hub.add(socket);
     void snapshot().then((stats) => {
       if (socket.readyState === 1) {
@@ -463,18 +627,46 @@ async function main(): Promise<void> {
     console.log(`[http] REST + WebSocket on http://${HTTP_BIND}:${HTTP_PORT}`);
     console.log(`[ws]   ws://${HTTP_BIND}:${HTTP_PORT}/ws`);
     if (HTTP_BIND === "0.0.0.0") {
+      const token = ensureLanToken();
       console.log("[http] lab mode: API reachable on this Mac's LAN IPv4");
+      console.log(`[http] LAN token: ${token}`);
     }
   });
 
-  const retention = setInterval(() => {
-    void db.pruneEvents(200_000, 7).then((n) => {
+  let upkeep: Promise<void> = Promise.resolve();
+  const queueUpkeep = (job: () => Promise<void>) => {
+    upkeep = upkeep.then(job).catch((err) => console.warn("[siem] upkeep failed", err));
+  };
+  const retain = async () => {
+    const settings = getSettings();
+    try {
+      const n = await db.pruneEvents(settings.maxEvents, settings.retentionDays);
       if (n > 0) console.log(`[siem] pruned ${n} old events`);
-    });
-    void db.expirePendingResponses(24);
-  }, 60 * 60 * 1000);
-  void db.pruneEvents(200_000, 7);
-  void db.expirePendingResponses(24);
+    } catch (err) {
+      console.warn("[siem] retention failed", err);
+    }
+    try {
+      await db.expirePendingResponses(24);
+    } catch (err) {
+      console.warn("[siem] response expiry failed", err);
+    }
+  };
+  const backup = async () => {
+    const age = latestBackupAgeMs();
+    if (age !== null && age < 20 * 60 * 60 * 1000) return;
+    try {
+      const file = await backupDatabase(db);
+      console.log(`[siem] backup ${file}`);
+    } catch (err) {
+      console.warn("[siem] backup failed", err);
+    }
+  };
+  const retention = setInterval(() => queueUpkeep(retain), 60 * 60 * 1000);
+  const backups = setInterval(() => queueUpkeep(backup), 6 * 60 * 60 * 1000);
+  queueUpkeep(async () => {
+    await retain();
+    await backup();
+  });
 
   aggregator.start(AGG_INTERVAL);
   void llm.start();
@@ -483,14 +675,14 @@ async function main(): Promise<void> {
     for (const rec of records) {
       hub.broadcast({ type: "fim", payload: rec });
       void collector.ingestLive(
-        `<4>1 ${new Date().toISOString()} ${computerName()} fim - - - file changed ${rec.path}`,
+        `<4>1 ${new Date().toISOString()} ${computerName()} fim - - - file changed ${rec.path} size=${rec.size ?? "?"} mode=${rec.mode ?? "?"}`,
         "host",
         "127.0.0.1"
       );
     }
   });
   const stopInventory = startInventoryLoop(db, (result) => {
-    collector.refreshInventoryCves(result.hits.map((hit) => hit.cve));
+    collector.refreshInventoryCves(highConfidenceCves(result.hits));
     for (const hit of result.hits) hub.broadcast({ type: "inventory_hit", payload: hit });
   });
 
@@ -501,8 +693,10 @@ async function main(): Promise<void> {
     stopFim();
     stopInventory();
     clearInterval(retention);
+    clearInterval(backups);
     aggregator.stop();
     await collector.stop();
+    await llm.stop();
     wss.close();
     server.close();
     await db.close();

@@ -1,0 +1,28 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2907
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 Act as an expert DevSecOps and Platform Engineer. I want to use "Grok Build" to create a local, cross-platform SIEM laboratory engine. The core system must run via localhost and collect data from macOS, Windows, and Linux endpoints.\
+\
+Please generate a complete project directory structure with all necessary files to stand this up immediately.\
+\
+### Requirements:\
+1. Orchestration: Provide a root-level `docker-compose.yml` spinning up OpenSearch (v2.x) and OpenSearch Dashboards on localhost (ports 9200 and 5601). Disable the security plugin for easy localhost lab testing as this is a local sandbox.\
+2. Cross-Platform Configurations: Inside an `agents/` directory, provide optimized configuration files (`elastic-agent.yml`) for:\
+   - macOS (targeting unified/system logs)\
+   - Windows (targeting Windows Security Events and Microsoft-Windows-Sysmon/Operational)\
+   - Linux (targeting /var/log/auth.log and /var/log/syslog)\
+3. Standardized Fields: Ensure all configurations output via HTTP to http://localhost:9200 and format data adhering to the Elastic Common Schema (ECS) standard.\
+4. Deployment Automation: Provide an automation script (Bash for Mac/Linux, PowerShell for Windows) that installs/starts the container and outputs step-by-step CLI commands to register the local host agents manually.\
+\
+### Deliverables Needed:\
+- Complete directory map\
+- `docker-compose.yml`\
+- The individual OS `elastic-agent.yml` configurations \
+- Readme.md deployment documentation with precise cross-platform agent install commands\
+\
+Ensure all code blocks are clean, production-ready, and contain no pseudocode.\
+}

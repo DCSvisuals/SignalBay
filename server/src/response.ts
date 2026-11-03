@@ -11,6 +11,8 @@ const BLOCKLIST = path.join(APP_SUPPORT, "blocklist.txt");
 const QUARANTINE = path.join(APP_SUPPORT, "quarantine");
 
 const ALLOWED = new Set(["block_ip", "kill_pid", "quarantine"]);
+const PROTECTED_PROCS =
+  /^(sshd|trustd|syslogd|launchd|kernel|log|WindowServer|loginwindow|configd|kernel_task|taskgated)$/i;
 
 export async function executeResponse(action: ResponseAction): Promise<{
   status: "executed" | "failed";
@@ -38,31 +40,72 @@ export async function undoResponse(action: ResponseAction): Promise<{
   return undoBlockIp(action.target);
 }
 
+function listedIps(): string[] {
+  if (!fs.existsSync(BLOCKLIST)) return [];
+  return fs
+    .readFileSync(BLOCKLIST, "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function anchorPath(): string {
+  return path.join(APP_SUPPORT, "localsiem.pf.conf");
+}
+
+export function renderAnchor(ips: string[]): string {
+  const body = ips.length ? ips.join(" ") : "";
+  return [
+    `table <localsiem> persist { ${body} }`,
+    "block drop in quick from <localsiem> to any",
+    "block drop out quick from any to <localsiem>",
+    ""
+  ].join("\n");
+}
+
+export async function pfTableStatus(): Promise<{ ready: boolean; detail: string; anchor: string }> {
+  const anchor = anchorPath();
+  try {
+    const { stdout, stderr } = await execFileAsync("sudo", ["-n", "pfctl", "-t", "localsiem", "-T", "show"], {
+      timeout: 8000
+    });
+    return { ready: true, detail: (stdout || stderr).trim() || "pf table localsiem is loaded", anchor };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      ready: false,
+      detail: `${detail}\nLoad the anchor with: sudo pfctl -a localsiem -f ${anchor}`,
+      anchor
+    };
+  }
+}
+
+async function reloadAnchor(ips: string[]): Promise<{ ok: boolean; detail: string }> {
+  ensureAppSupport();
+  const file = anchorPath();
+  fs.writeFileSync(file, renderAnchor(ips));
+  try {
+    const { stdout, stderr } = await execFileAsync("sudo", ["-n", "pfctl", "-a", "localsiem", "-f", file], {
+      timeout: 8000
+    });
+    return { ok: true, detail: (stdout + stderr).trim() || `Loaded ${file}` };
+  } catch (err) {
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 async function undoBlockIp(ip: string): Promise<{ status: "undone" | "failed"; output: string }> {
   ensureAppSupport();
-  if (fs.existsSync(BLOCKLIST)) {
-    const next = fs
-      .readFileSync(BLOCKLIST, "utf8")
-      .split("\n")
-      .filter((line) => line && line !== ip);
-    fs.writeFileSync(BLOCKLIST, next.length ? `${next.join("\n")}\n` : "");
-  }
-  try {
-    const { stdout, stderr } = await execFileAsync(
-      "sudo",
-      ["-n", "pfctl", "-t", "localsiem", "-T", "delete", ip],
-      { timeout: 8000 }
-    );
+  const next = listedIps().filter((line) => line !== ip);
+  fs.writeFileSync(BLOCKLIST, next.length ? `${next.join("\n")}\n` : "");
+  const loaded = await reloadAnchor(next);
+  if (!loaded.ok) {
     return {
-      status: "undone",
-      output: (stdout + stderr).trim() || `Removed ${ip} from pf table localsiem`
-    };
-  } catch (err) {
-    return {
-      status: "undone",
-      output: `Removed ${ip} from ${BLOCKLIST}. pfctl undo: ${err instanceof Error ? err.message : String(err)}`
+      status: "failed",
+      output: `Removed ${ip} from ${BLOCKLIST}. pf still has the old anchor: ${loaded.detail}`
     };
   }
+  return { status: "undone", output: `Removed ${ip} from the localsiem anchor. ${loaded.detail}`.trim() };
 }
 
 async function blockIp(ip: string): Promise<{ status: "executed" | "failed"; output: string }> {
@@ -70,24 +113,19 @@ async function blockIp(ip: string): Promise<{ status: "executed" | "failed"; out
     return { status: "failed", output: "Refusing to block this address (loopback, self, or invalid)" };
   }
   ensureAppSupport();
-  const existing = fs.existsSync(BLOCKLIST) ? fs.readFileSync(BLOCKLIST, "utf8") : "";
-  if (!existing.split("\n").includes(ip)) {
-    fs.appendFileSync(BLOCKLIST, `${ip}\n`);
+  const ips = listedIps();
+  if (!ips.includes(ip)) ips.push(ip);
+  fs.writeFileSync(BLOCKLIST, ips.length ? `${ips.join("\n")}\n` : "");
+  const loaded = await reloadAnchor(ips);
+  const notes = [`Wrote ${ip} to ${BLOCKLIST}`];
+  if (!loaded.ok) {
+    notes.push("pf did not load the anchor. The address is listed, and it is not blocked.");
+    notes.push(loaded.detail);
+    notes.push("Run scripts/install_pf_anchor.sh, then confirm the action again.");
+    return { status: "failed", output: notes.join("\n") };
   }
-  const notes: string[] = [`Wrote ${ip} to ${BLOCKLIST}`];
-  try {
-    const { stdout, stderr } = await execFileAsync("sudo", ["-n", "pfctl", "-t", "localsiem", "-T", "add", ip], {
-      timeout: 8000
-    });
-    notes.push((stdout + stderr).trim() || "pfctl table updated");
-    return { status: "executed", output: notes.join("\n") };
-  } catch (err) {
-    notes.push(
-      `pfctl needs passwordless sudo for table localsiem. Command: sudo pfctl -t localsiem -T add ${ip}`
-    );
-    notes.push(err instanceof Error ? err.message : String(err));
-    return { status: "executed", output: notes.join("\n") };
-  }
+  notes.push(loaded.detail || "pf anchor localsiem reloaded");
+  return { status: "executed", output: notes.join("\n") };
 }
 
 async function killPid(pidRaw: string): Promise<{ status: "executed" | "failed"; output: string }> {
@@ -95,10 +133,18 @@ async function killPid(pidRaw: string): Promise<{ status: "executed" | "failed";
   if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
     return { status: "failed", output: "Refusing to signal this PID" };
   }
+  if (pid > 999999) {
+    return { status: "failed", output: "PID out of range" };
+  }
   try {
-    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "comm="], { timeout: 2000 });
-    const comm = stdout.trim().replace(/^-/, "");
-    if (/^(sshd|trustd|syslogd|launchd|kernel|log|WindowServer|loginwindow|configd)$/i.test(comm)) {
+    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "comm=", "uid="], { timeout: 2000 });
+    const parts = stdout.trim().split(/\s+/);
+    const comm = parts[0]?.replace(/^-/, "") ?? "";
+    const uid = parts[1];
+    if (uid === "0") {
+      return { status: "failed", output: `Refusing to kill root-owned process ${comm} (${pid})` };
+    }
+    if (PROTECTED_PROCS.test(comm)) {
       return { status: "failed", output: `Refusing to kill protected process ${comm} (${pid})` };
     }
   } catch {
@@ -117,10 +163,7 @@ async function quarantinePath(target: string): Promise<{ status: "executed" | "f
   const home = process.env.HOME ?? "";
   const allowedRoots = ["/tmp", "/private/tmp", path.join(home, "Downloads"), path.join(home, "Desktop")];
   if (!allowedRoots.some((root) => resolved === root || resolved.startsWith(`${root}/`))) {
-    return {
-      status: "failed",
-      output: "Quarantine is limited to /tmp, Downloads, and Desktop"
-    };
+    return { status: "failed", output: "Quarantine is limited to /tmp, Downloads, and Desktop" };
   }
   if (!fs.existsSync(resolved)) {
     return { status: "failed", output: `Path not found: ${resolved}` };

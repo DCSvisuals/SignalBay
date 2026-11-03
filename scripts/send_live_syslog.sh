@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Send real syslog to LocalSIEM Live Dashboard (not Demo).
+# Send real syslog to the Signalbay Live Dashboard (not Demo).
 # Usage: ./scripts/send_live_syslog.sh [count] [udp|tcp|tls|relp] [port]
 set -euo pipefail
 

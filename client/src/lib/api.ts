@@ -1,6 +1,7 @@
 import type {
   EventOrigin,
   FimRecord,
+  CaseNote,
   Incident,
   InventoryHit,
   LlmStatus,
@@ -37,6 +38,9 @@ export const api = {
     to?: string;
     transport?: string;
     app?: string;
+    user?: string;
+    src?: string;
+    category?: string;
     limit?: number;
   }) => {
     const p = new URLSearchParams();
@@ -46,16 +50,65 @@ export const api = {
     if (opts.to) p.set("to", opts.to);
     if (opts.transport) p.set("transport", opts.transport);
     if (opts.app) p.set("app", opts.app);
+    if (opts.user) p.set("user", opts.user);
+    if (opts.src) p.set("src", opts.src);
+    if (opts.category) p.set("category", opts.category);
     return request<LogEvent[]>(`/api/hunt?${p.toString()}`);
   },
+  entity: (kind: "host" | "user" | "ip", value: string) =>
+    request<{
+      kind: string;
+      value: string;
+      events: LogEvent[];
+      firstSeen: string | null;
+      lastSeen: string | null;
+      eventCount: number;
+      openIncidents: number;
+      actions: Array<{ action: string; n: number }>;
+    }>(`/api/entity?kind=${kind}&value=${encodeURIComponent(value)}`),
   iocs: () => request<IocRecord[]>("/api/iocs"),
-  addIoc: (body: { kind: string; value: string; note: string | null }) =>
+  addIoc: (body: { kind: string; value: string; note: string | null; expiresInDays?: number }) =>
     request<IocRecord[]>("/api/iocs", { method: "POST", body: JSON.stringify(body) }),
   deleteIoc: (id: number) => request<IocRecord[]>(`/api/iocs/${id}`, { method: "DELETE" }),
   customRules: () => request<unknown[]>("/api/rules"),
   saveCustomRules: (rules: unknown) =>
     request<unknown[]>("/api/rules", { method: "PUT", body: JSON.stringify(rules) }),
   reportSummary: (hours = 24) => request<ReportSummary>(`/api/reports/summary?hours=${hours}`),
+  reportSeries: (hours = 24) =>
+    request<{
+      buckets: Array<{ hour: string; n: number }>;
+      failedUsers: Array<{ user: string; n: number }>;
+      publicSources: Array<{ ip: string; n: number }>;
+    }>(`/api/reports/series?hours=${hours}`),
+  settings: () =>
+    request<{ retentionDays: number; maxEvents: number; webhookUrl: string; tlsClientAuth: boolean }>(
+      "/api/settings"
+    ),
+  saveSettings: (body: { retentionDays?: number; maxEvents?: number; webhookUrl?: string }) =>
+    request<{ retentionDays: number; maxEvents: number; webhookUrl: string }>("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify(body)
+    }),
+  backup: () => request<{ ok: boolean; file: string }>("/api/backup", { method: "POST" }),
+  audit: () => request<Array<{ id: number; createdAt: string; actor: string; action: string; detail: string | null }>>("/api/audit"),
+  detections: () =>
+    request<Array<{ id: string; name: string; summary: string; enabled: boolean }>>("/api/detections"),
+  setDetection: (id: string, enabled: boolean) =>
+    request<{ id: string; enabled: boolean }>(`/api/detections/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ enabled })
+    }),
+  exceptions: () =>
+    request<Array<{ id: string; kind: string; value: string; note: string; enabled: boolean }>>("/api/exceptions"),
+  saveExceptions: (rows: unknown) =>
+    request<Array<{ id: string; kind: string; value: string; note: string; enabled: boolean }>>("/api/exceptions", {
+      method: "PUT",
+      body: JSON.stringify(rows)
+    }),
+  caseNotes: (id: number) => request<CaseNote[]>(`/api/incidents/${id}/notes`),
+  addCaseNote: (id: number, body: string) =>
+    request<CaseNote>(`/api/incidents/${id}/notes`, { method: "POST", body: JSON.stringify({ body }) }),
+  pfStatus: () => request<{ ready: boolean; detail: string; anchor: string }>("/api/response/pf"),
   events: (q?: string, origin: EventOrigin = "live") =>
     request<LogEvent[]>(
       `/api/events?limit=250&origin=${origin}${q ? `&q=${encodeURIComponent(q)}` : ""}`
@@ -95,6 +148,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ id })
     }),
+  importLlm: (source: string) =>
+    request<LlmStatus>("/api/llm/import", {
+      method: "POST",
+      body: JSON.stringify({ source })
+    }),
   saveLlmKeys: (
     keys: Partial<
       Record<
@@ -114,10 +172,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(keys)
     }),
-  setIncidentStatus: (id: number, status: Incident["status"]) =>
+  setIncidentStatus: (
+    id: number,
+    status: Incident["status"],
+    extra?: { assignee?: string; closeReason?: string }
+  ) =>
     request<Incident>(`/api/incidents/${id}/status`, {
       method: "POST",
-      body: JSON.stringify({ status })
+      body: JSON.stringify({ status, ...extra })
     }),
   fim: (origin: EventOrigin = "live") => request<FimRecord[]>(`/api/fim?origin=${origin}`),
   inventoryHits: () => request<InventoryHit[]>("/api/inventory/hits"),

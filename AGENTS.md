@@ -1,4 +1,4 @@
-# AGENTS.md: Centralized macOS Web-SIEM & Cyber News Aggregator Platform
+# AGENTS.md: Signalbay — macOS Web-SIEM & Cyber News Aggregator
 
 ## Project Overview
 Build a self-contained, privacy-focused web application engineered exclusively for macOS (optimized for Apple Silicon). The system is built using a decoupled React front-end and a Node.js backend running over a local SQLite engine:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LocalSIEM launcher: Metal-compiled node-llama-cpp backend + React dashboard.
+# Signalbay launcher: Metal-compiled node-llama-cpp backend + React dashboard.
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -54,7 +54,7 @@ draw() {
       "TLS syslog    pending" \
       "RELP          pending")"
   fi
-  tui_frame "$VERSION" "$PCT" "$STATUS" "$health"$'\n'"$BODY" "Ctrl+C or Q stops LocalSIEM. Server pid ${SERVER_PID:-—}"
+  tui_frame "$VERSION" "$PCT" "$STATUS" "$health"$'\n'"$BODY" "Ctrl+C or Q stops Signalbay. Server pid ${SERVER_PID:-—}"
 }
 
 confirm_reset() {
@@ -62,7 +62,7 @@ confirm_reset() {
   local choice
   choice="$(osascript <<'EOF'
 try
-  set theButton to button returned of (display dialog "Reset LocalSIEM to a first launch?
+  set theButton to button returned of (display dialog "Reset Signalbay to a first launch?
 
 This wipes:
 • the SQLite database (events, incidents, FIM, inventory)
@@ -72,7 +72,7 @@ This wipes:
 
 Your project files on Desktop/CyberNews are not deleted.
 
-LocalSIEM will quit and open again." buttons {"Cancel", "Reset and Quit and Open"} default button "Cancel" with title "Reset LocalSIEM" with icon caution)
+Signalbay will quit and open again." buttons {"Cancel", "Reset and Quit and Open"} default button "Cancel" with title "Reset Signalbay" with icon caution)
   return theButton
 on error
   return "Cancel"
@@ -122,7 +122,7 @@ poll_key() {
 }
 
 tui_init
-STATUS="Opening LocalSIEM control screen…"
+STATUS="Opening Signalbay control screen…"
 PCT=1
 BODY="localhost collectors · dashboard · API health"
 draw
@@ -147,7 +147,7 @@ draw
 cleanup() {
   tui_restore
   echo
-  echo "==> stopping LocalSIEM"
+  echo "==> stopping Signalbay"
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
   [[ -n "${CLIENT_PID:-}" ]] && kill "$CLIENT_PID" 2>/dev/null || true
   wait 2>/dev/null || true
@@ -155,9 +155,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if curl -sf --max-time 1 -H 'Accept: application/json' "$API?format=json" >/dev/null 2>&1; then
-  STATUS="LocalSIEM is already running — live status"
+  STATUS="Signalbay is already running — live status"
   PCT=100
-  BODY="This window is the control screen. Q stops LocalSIEM. R resets to first launch."
+  BODY="This window is the control screen. Q stops Signalbay. R resets to first launch."
   SERVER_PID="$(lsof -nP -iTCP:3001 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
   CLIENT_PID="$(lsof -nP -iTCP:5174 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
   if [[ -z "$CLIENT_PID" ]]; then
@@ -279,7 +279,7 @@ done
 
 open "$UI" 2>/dev/null || true
 PCT=100
-STATUS="LocalSIEM is running on localhost."
+STATUS="Signalbay is running on localhost."
 BODY="Press Q to quit. Press R to wipe logs/cache and start like first launch."
 draw
 

@@ -2,6 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { hub } from "./bus.js";
 import { allProviderStatus, getCloudModel, getKey, type CloudProvider } from "./llmKeys.js";
+import { MIN_GGUF_BYTES, parseModelSource, placeLocalGguf, placeMlxDir } from "./llmImport.js";
+import { MLX_MODELS, isMlxModelDir, listMlxOptions, mlxOptionId, mlxWeightsDir } from "./mlxCatalog.js";
+import { MlxWorker, downloadMlxRepo } from "./mlxRuntime.js";
 import { MODELS_DIR, ensureAppSupport } from "./paths.js";
 import type { Incident, LlmOption, LlmProvider, LlmStatus, NewsItem } from "./types.js";
 
@@ -151,7 +154,7 @@ export function listLlmOptions(): LlmOption[] {
     cached: Boolean(findCachedGguf({ ...rest, aliases } as LocalSpec, rest.model))
   }));
   const extras = extraLocalFiles().map((item) => ({ ...item, cached: true }));
-  return [...locals, ...extras, ...CLOUD_OPTIONS];
+  return [...locals, ...extras, ...listMlxOptions(), ...CLOUD_OPTIONS];
 }
 
 function findCachedGguf(spec: LocalSpec | undefined, modelName: string): string | null {
@@ -177,14 +180,14 @@ function findCachedGguf(spec: LocalSpec | undefined, modelName: string): string 
 }
 
 const SYSTEM_LOCAL = [
-  "You are a senior macOS detection engineer embedded in LocalSIEM.",
+  "You are a senior macOS detection engineer embedded in Signalbay.",
   "All inference is local. Never suggest cloud lookups.",
   "Be concise, technical, and actionable.",
   "Prefer copyable zsh commands that work on Apple Silicon macOS."
 ].join(" ");
 
 const SYSTEM_CLOUD = [
-  "You are a senior macOS detection engineer assisting LocalSIEM.",
+  "You are a senior macOS detection engineer assisting Signalbay.",
   "Be concise, technical, and actionable.",
   "Prefer copyable zsh commands that work on Apple Silicon macOS."
 ].join(" ");
@@ -231,9 +234,85 @@ export class LlmEngine {
   private draining = false;
   private localReady = false;
   private loadedLocalId: string | null = null;
+  private mlx = new MlxWorker();
 
   async start(): Promise<void> {
     await this.select("local-qwen");
+  }
+
+  /** Re-read the models folder so a newly added GGUF shows up without a restart. */
+  listedStatus(): LlmStatus {
+    this.status = { ...this.status, options: listLlmOptions() };
+    return this.status;
+  }
+
+  async stop(): Promise<void> {
+    this.mlx.stop();
+  }
+
+  async importLocal(source: string): Promise<LlmStatus> {
+    try {
+      const parsed = parseModelSource(source);
+      ensureAppSupport();
+      if (parsed.kind === "mlx-repo") {
+        await this.fetchMlx(parsed.repo, parsed.dirName);
+        return this.select(mlxOptionId(parsed.dirName, parsed.repo));
+      }
+      if (parsed.kind === "mlx-dir") {
+        const stored = placeMlxDir(parsed.localPath, MODELS_DIR);
+        return this.select(mlxOptionId(path.basename(stored)));
+      }
+      let stored: string;
+      if (parsed.localPath) {
+        stored = placeLocalGguf(parsed.localPath, MODELS_DIR);
+      } else {
+        const dest = path.join(MODELS_DIR, parsed.fileName);
+        const ready = fs.existsSync(dest) && fs.statSync(dest).size >= MIN_GGUF_BYTES;
+        if (!ready) {
+          const downloadingId = this.idForInstalledName(parsed.fileName);
+          this.setStatus({
+            downloadingId,
+            downloadPercent: 0,
+            message: `Downloading ${parsed.fileName}`
+          });
+          await downloadFile(parsed.url ?? "", dest, (pct) => {
+            this.setStatus({
+              downloadingId,
+              downloadPercent: pct,
+              message: `Downloading ${parsed.fileName} · ${pct}%`
+            });
+          });
+          if (!fs.existsSync(dest) || fs.statSync(dest).size < MIN_GGUF_BYTES) {
+            fs.rmSync(dest, { force: true });
+            throw new Error("The download is smaller than 50 MB, so it was discarded");
+          }
+        }
+        stored = dest;
+      }
+      const fileName = path.basename(stored);
+      this.setStatus({
+        downloadingId: null,
+        downloadPercent: null,
+        message: `Added ${fileName}`
+      });
+      return this.select(this.idForInstalledName(fileName));
+    } catch (err) {
+      this.setStatus({
+        downloadingId: null,
+        downloadPercent: null,
+        message: err instanceof Error ? err.message : "Could not add that model"
+      });
+      throw err;
+    }
+  }
+
+  private idForInstalledName(fileName: string): string {
+    const lower = fileName.toLowerCase();
+    for (const item of LOCAL_MODELS) {
+      const needles = [item.hfFile, item.model, ...item.aliases].map((name) => name.toLowerCase());
+      if (needles.some((name) => lower === name || lower.includes(name))) return item.id;
+    }
+    return `local-file-${fileName}`;
   }
 
   async refreshAfterKeys(): Promise<LlmStatus> {
@@ -281,11 +360,15 @@ export class LlmEngine {
     }
 
     if (this.localReady && this.session && this.loadedLocalId === option.id) {
+      const mlx = option.runtime === "mlx";
       this.setStatus({
         state: "ready",
         metal: true,
-        gpuLayers: "max",
-        message: `Ready on metal · ${option.model} fully offloaded`
+        gpu: mlx ? "mlx" : this.status.gpu,
+        gpuLayers: mlx ? "mlx" : "max",
+        message: mlx
+          ? `Ready on MLX · ${option.label}`
+          : `Ready on metal · ${option.model} fully offloaded`
       });
       return this.status;
     }
@@ -341,6 +424,11 @@ export class LlmEngine {
   }
 
   private async startLocal(): Promise<void> {
+    if (this.selected.runtime === "mlx") {
+      await this.startMlx();
+      return;
+    }
+    this.mlx.stop();
     this.localStatus({
       state: "compiling",
       metal: true,
@@ -457,7 +545,94 @@ export class LlmEngine {
     this.draining = false;
   }
 
+  private async startMlx(): Promise<void> {
+    if (process.platform !== "darwin" || process.arch !== "arm64") {
+      this.setStatus({
+        state: "error",
+        gpu: "mlx",
+        metal: false,
+        message: "MLX runs on Apple Silicon"
+      });
+      return;
+    }
+    this.localStatus({
+      state: "loading",
+      gpu: "mlx",
+      metal: true,
+      message: `Loading ${this.selected.label} with MLX`
+    });
+    try {
+      const dir = await this.ensureMlxDir();
+      await this.mlx.load(dir);
+      this.session = {
+        prompt: (text, opts) => this.mlx.complete(SYSTEM_LOCAL, text, opts?.maxTokens ?? 256)
+      };
+      this.localReady = true;
+      this.loadedLocalId = this.selected.id;
+      this.setStatus({
+        state: "ready",
+        gpu: "mlx",
+        gpuLayers: "mlx",
+        metal: true,
+        message: `Ready on MLX · ${this.selected.label}`
+      });
+      console.log(`[llm] mlx ready model=${dir}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[llm] failed to start MLX", err);
+      this.mlx.stop();
+      this.setStatus({
+        state: "error",
+        gpu: "mlx",
+        metal: true,
+        message: `MLX unavailable: ${message}`
+      });
+    }
+  }
+
+  private async ensureMlxDir(): Promise<string> {
+    const catalog = MLX_MODELS.find((item) => item.id === this.selected.id);
+    const dirName = catalog?.dirName ?? this.selected.model;
+    const dir = mlxWeightsDir(dirName);
+    if (isMlxModelDir(dir)) return dir;
+    if (!catalog) throw new Error(`No MLX weights for ${this.selected.label}. Add the model folder from the LLM menu.`);
+    await this.fetchMlx(catalog.repo, catalog.dirName);
+    if (!isMlxModelDir(dir)) throw new Error(`Download of ${catalog.repo} did not produce MLX weights`);
+    return dir;
+  }
+
+  private async fetchMlx(repo: string, dirName: string): Promise<void> {
+    const dir = mlxWeightsDir(dirName);
+    if (isMlxModelDir(dir)) return;
+    const downloadingId = mlxOptionId(dirName, repo);
+    this.setStatus({
+      downloadingId,
+      downloadPercent: null,
+      gpu: "mlx",
+      message: `Downloading ${repo}`
+    });
+    await downloadMlxRepo(repo, dir);
+    this.setStatus({
+      downloadingId: null,
+      downloadPercent: null,
+      message: `Downloaded ${repo}`
+    });
+  }
+
   async prefetch(id: string): Promise<LlmStatus> {
+    const mlx = MLX_MODELS.find((item) => item.id === id);
+    if (mlx) {
+      try {
+        await this.fetchMlx(mlx.repo, mlx.dirName);
+      } catch (err) {
+        this.setStatus({
+          downloadingId: null,
+          downloadPercent: null,
+          message: err instanceof Error ? err.message : `Download failed for ${mlx.label}`
+        });
+      }
+      return this.listedStatus();
+    }
     const spec = LOCAL_MODELS.find((item) => item.id === id);
     if (!spec) return this.status;
     if (findCachedGguf(spec, spec.model)) {
@@ -633,7 +808,7 @@ async function downloadFile(
 ): Promise<void> {
   const tmp = `${dest}.partial`;
   const res = await fetch(url, {
-    headers: { "User-Agent": "LocalSIEM/1.0" },
+    headers: { "User-Agent": "Signalbay/1.0" },
     redirect: "follow"
   });
   if (!res.ok || !res.body) {

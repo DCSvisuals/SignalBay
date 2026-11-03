@@ -2,7 +2,7 @@ import { Copy, Newspaper, Sparkles, Terminal } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import { incidentCves, newsForCves } from "../lib/cveNews";
-import type { Incident, LlmStatus, NewsItem } from "../types";
+import type { CaseNote, Incident, LlmStatus, NewsItem } from "../types";
 import { CveNewsPopup } from "./CveNewsPopup";
 import { MarkdownView } from "./MarkdownView";
 import { SeverityGauge } from "./SeverityGauge";
@@ -19,6 +19,10 @@ export function AiTriageViewport({ incident, llm, news, onUpdated }: Props) {
   const [copied, setCopied] = useState(false);
   const [showNews, setShowNews] = useState(false);
   const [cveArticles, setCveArticles] = useState<NewsItem[]>([]);
+  const [notes, setNotes] = useState<CaseNote[]>([]);
+  const [note, setNote] = useState("");
+  const [assignee, setAssignee] = useState("");
+  const [closeReason, setCloseReason] = useState("");
 
   const cves = useMemo(() => (incident ? incidentCves(incident) : []), [incident]);
   const localMatch = useMemo(() => newsForCves(news, cves), [news, cves]);
@@ -39,6 +43,13 @@ export function AiTriageViewport({ incident, llm, news, onUpdated }: Props) {
   useEffect(() => {
     setShowNews(false);
     setCveArticles([]);
+    setAssignee(incident?.assignee ?? "");
+    setCloseReason(incident?.closeReason ?? "");
+    if (!incident) {
+      setNotes([]);
+      return;
+    }
+    void api.caseNotes(incident.id).then(setNotes).catch(() => setNotes([]));
     if (!incident?.aiSummary || !cves.length) return;
     let cancelled = false;
     void api
@@ -118,6 +129,57 @@ export function AiTriageViewport({ incident, llm, news, onUpdated }: Props) {
                   No GGUF summary yet. Run triage once the Metal engine reports ready.
                 </div>
               )}
+              <div className="case-box">
+                <p className="inner-kicker">Case</p>
+                <div className="hunt-form case-form">
+                  <input
+                    value={assignee}
+                    onChange={(event) => setAssignee(event.target.value)}
+                    placeholder="assignee"
+                  />
+                  <input
+                    value={closeReason}
+                    onChange={(event) => setCloseReason(event.target.value)}
+                    placeholder="close reason"
+                  />
+                  <button
+                    className="ghost"
+                    onClick={() =>
+                      void api
+                        .setIncidentStatus(incident.id, incident.status, {
+                          assignee,
+                          closeReason
+                        })
+                        .then(onUpdated)
+                    }
+                  >
+                    Save case
+                  </button>
+                </div>
+                <ul className="note-list">
+                  {notes.map((row) => (
+                    <li key={row.id}>
+                      <span>{row.createdAt.slice(11, 19)}</span> {row.body}
+                    </li>
+                  ))}
+                </ul>
+                <form
+                  className="hunt-form case-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (!note.trim()) return;
+                    void api.addCaseNote(incident.id, note.trim()).then((saved) => {
+                      setNotes((prev) => [...prev, saved]);
+                      setNote("");
+                    });
+                  }}
+                >
+                  <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="Add a note" />
+                  <button className="primary" type="submit">
+                    Add note
+                  </button>
+                </form>
+              </div>
               {(incident.containmentCommands || incident.aiSummary) && (
                 <button className="ghost copy-cmd" onClick={() => void copy()}>
                   {copied ? <Terminal size={13} /> : <Copy size={13} />}

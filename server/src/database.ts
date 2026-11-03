@@ -1,9 +1,16 @@
 import crypto from "node:crypto";
+import { once } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import { createGzip } from "node:zlib";
 import sqlite3 from "sqlite3";
-import { DB_PATH, ensureAppSupport } from "./paths.js";
+import { toFtsQuery } from "./ftsQuery.js";
 import { withNewsMeta } from "./newsMeta.js";
+import { APP_SUPPORT, DB_PATH, ensureAppSupport } from "./paths.js";
 import { cleanHtmlText } from "./text.js";
 import type {
+  AuditRecord,
+  CaseNote,
   EventOrigin,
   FimRecord,
   Incident,
@@ -30,13 +37,16 @@ function openDatabase(file: string): Promise<sqlite3.Database> {
 
 export class SiemDatabase {
   private db!: sqlite3.Database;
+  private ftsReady = false;
+
+  constructor(private file = DB_PATH) {}
 
   async init(): Promise<void> {
     ensureAppSupport();
-    this.db = await openDatabase(DB_PATH);
+    this.db = await openDatabase(this.file);
     this.db.serialize();
     await this.exec("PRAGMA journal_mode = WAL;");
-    await this.exec("PRAGMA synchronous = NORMAL;");
+    await this.exec("PRAGMA synchronous = FULL;");
     await this.exec("PRAGMA busy_timeout = 5000;");
     await this.exec("PRAGMA cache_size = -64000;");
     await this.exec("PRAGMA temp_store = MEMORY;");
@@ -117,6 +127,29 @@ export class SiemDatabase {
     await this.exec("CREATE INDEX IF NOT EXISTS idx_events_transport ON events(origin, transport, id);");
     await this.exec("CREATE INDEX IF NOT EXISTS idx_incidents_origin ON incidents(origin, id);");
     await this.ensureColumn("incidents", "mitre", "TEXT");
+    await this.ensureColumn("incidents", "assignee", "TEXT");
+    await this.ensureColumn("incidents", "close_reason", "TEXT");
+    await this.ensureColumn("events", "event_time", "TEXT");
+    await this.ensureColumn("events", "user_name", "TEXT");
+    await this.ensureColumn("events", "src_ip", "TEXT");
+    await this.ensureColumn("events", "category", "TEXT");
+    await this.ensureColumn("events", "action", "TEXT");
+    await this.run("UPDATE events SET event_time = received_at WHERE event_time IS NULL");
+    await this.exec(`
+      CREATE TABLE IF NOT EXISTS case_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        incident_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        author TEXT NOT NULL,
+        body TEXT NOT NULL
+      );
+    `);
+    await this.exec("CREATE INDEX IF NOT EXISTS idx_events_event_time ON events(event_time);");
+    await this.exec("CREATE INDEX IF NOT EXISTS idx_events_src ON events(src_ip);");
+    await this.exec("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_name);");
+    await this.exec("CREATE INDEX IF NOT EXISTS idx_events_action ON events(action);");
+    await this.exec("CREATE INDEX IF NOT EXISTS idx_case_notes ON case_notes(incident_id, id);");
+    await this.setupFts();
     await this.exec(`
       CREATE TABLE IF NOT EXISTS iocs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +220,12 @@ export class SiemDatabase {
         origin TEXT NOT NULL DEFAULT 'live'
       );
     `);
+    await this.ensureColumn("iocs", "expires_at", "TEXT");
+    await this.ensureColumn("fim_files", "size", "INTEGER");
+    await this.ensureColumn("fim_files", "mode", "TEXT");
+    await this.ensureColumn("fim_files", "mtime", "TEXT");
+    await this.ensureColumn("inventory_hits", "confidence", "TEXT NOT NULL DEFAULT 'medium'");
+    await this.ensureColumn("inventory_hits", "installed_version", "TEXT");
     await this.run(
       `UPDATE events SET origin = 'demo'
        WHERE origin = 'live'
@@ -205,6 +244,54 @@ export class SiemDatabase {
     const cols = await this.all<{ name: string }>(`PRAGMA table_info(${table})`);
     if (!cols.some((col) => col.name === name)) {
       await this.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`);
+    }
+  }
+
+  private async setupFts(): Promise<void> {
+    try {
+      await this.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+          message, hostname, app_name, raw, user_name, src_ip,
+          content='events', content_rowid='id', tokenize='unicode61'
+        );
+      `);
+      // Delete commands must repeat the indexed bytes. The old triggers stored
+      // coalesce(NULL, ''), which does not match a content rebuild, and that index
+      // made a later DELETE return SQLITE_CORRUPT on the bundled SQLite.
+      const existing = await this.all<{ sql: string | null }>(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'trigger' AND name IN ('events_fts_insert', 'events_fts_delete')`
+      );
+      const stale =
+        existing.length < 2 ||
+        existing.some((row) => (row.sql ?? "").toLowerCase().includes("coalesce"));
+      await this.exec("DROP TRIGGER IF EXISTS events_fts_insert");
+      await this.exec("DROP TRIGGER IF EXISTS events_fts_delete");
+      await this.exec(`
+        CREATE TRIGGER events_fts_insert AFTER INSERT ON events BEGIN
+          INSERT INTO events_fts(rowid, message, hostname, app_name, raw, user_name, src_ip)
+          VALUES (
+            new.id, new.message, new.hostname, new.app_name, new.raw, new.user_name, new.src_ip
+          );
+        END;
+      `);
+      await this.exec(`
+        CREATE TRIGGER events_fts_delete AFTER DELETE ON events BEGIN
+          INSERT INTO events_fts(events_fts, rowid, message, hostname, app_name, raw, user_name, src_ip)
+          VALUES (
+            'delete', old.id, old.message, old.hostname, old.app_name, old.raw, old.user_name, old.src_ip
+          );
+        END;
+      `);
+      const indexed = await this.get<{ n: number }>("SELECT COUNT(*) AS n FROM events_fts_docsize");
+      const events = await this.get<{ n: number }>("SELECT COUNT(*) AS n FROM events");
+      if (stale || (indexed?.n ?? 0) !== (events?.n ?? 0)) {
+        await this.exec("INSERT INTO events_fts(events_fts) VALUES('rebuild')");
+      }
+      this.ftsReady = true;
+    } catch (err) {
+      this.ftsReady = false;
+      console.warn("[database] full-text search unavailable", err);
     }
   }
 
@@ -246,6 +333,7 @@ export class SiemDatabase {
 
   async insertEvent(input: {
     receivedAt: string;
+    eventTime?: string;
     facility: number | null;
     severity: number | null;
     hostname: string | null;
@@ -262,13 +350,19 @@ export class SiemDatabase {
     try {
       const origin = input.origin ?? "live";
       const transport = input.transport ?? "udp";
+      const userName = strField(input.parsed.user);
+      const srcIp = strField(input.parsed.src_ip) ?? input.sourceIp;
+      const category = strField(input.parsed.category);
+      const action = strField(input.parsed.action);
       const result = await this.run(
         `INSERT INTO events (
-          received_at, facility, severity, hostname, app_name, proc_id,
-          message, raw, source_ip, parsed_json, hash, origin, transport
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          received_at, event_time, facility, severity, hostname, app_name, proc_id,
+          message, raw, source_ip, parsed_json, hash, origin, transport,
+          user_name, src_ip, category, action
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           input.receivedAt,
+          input.eventTime || input.receivedAt,
           input.facility,
           input.severity,
           input.hostname,
@@ -280,7 +374,11 @@ export class SiemDatabase {
           JSON.stringify(input.parsed),
           input.hash,
           origin,
-          transport
+          transport,
+          userName,
+          srcIp,
+          category,
+          action
         ]
       );
       const row = await this.get<EventRow>("SELECT * FROM events WHERE id = ?", [
@@ -304,45 +402,82 @@ export class SiemDatabase {
     to?: string;
     transport?: string;
     app?: string;
+    user?: string;
+    srcIp?: string;
+    category?: string;
     origin?: EventOrigin;
   } = {}): Promise<LogEvent[]> {
     const limit = Math.min(Math.max(opts.limit ?? 200, 1), 2000);
-    const clauses: string[] = [];
-    const params: SqlParams = [];
-    clauses.push("origin = ?");
-    params.push(opts.origin ?? "live");
-    if (opts.q) {
-      clauses.push(
-        "(message LIKE ? OR hostname LIKE ? OR app_name LIKE ? OR raw LIKE ? OR source_ip LIKE ?)"
-      );
-      const like = `%${opts.q}%`;
-      params.push(like, like, like, like, like);
+    const build = (useFts: boolean) => {
+      const clauses: string[] = [];
+      const params: SqlParams = [];
+      clauses.push("origin = ?");
+      params.push(opts.origin ?? "live");
+      if (opts.q && useFts) {
+        const match = toFtsQuery(opts.q);
+        if (match) {
+          clauses.push("id IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)");
+          params.push(match);
+        }
+      } else if (opts.q) {
+        clauses.push(
+          "(message LIKE ? OR hostname LIKE ? OR app_name LIKE ? OR raw LIKE ? OR source_ip LIKE ? OR ifnull(user_name,'') LIKE ? OR ifnull(src_ip,'') LIKE ?)"
+        );
+        const like = `%${opts.q}%`;
+        params.push(like, like, like, like, like, like, like);
+      }
+      if (opts.before) {
+        clauses.push("received_at < ?");
+        params.push(opts.before);
+      }
+      if (opts.from) {
+        clauses.push("COALESCE(event_time, received_at) >= ?");
+        params.push(opts.from);
+      }
+      if (opts.to) {
+        clauses.push("COALESCE(event_time, received_at) <= ?");
+        params.push(opts.to);
+      }
+      if (opts.transport) {
+        clauses.push("transport = ?");
+        params.push(opts.transport);
+      }
+      if (opts.app) {
+        clauses.push("app_name LIKE ?");
+        params.push(`%${opts.app}%`);
+      }
+      if (opts.user) {
+        clauses.push("user_name LIKE ?");
+        params.push(`%${opts.user}%`);
+      }
+      if (opts.srcIp) {
+        clauses.push("src_ip = ?");
+        params.push(opts.srcIp);
+      }
+      if (opts.category) {
+        clauses.push("category = ?");
+        params.push(opts.category);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+      params.push(limit);
+      return { where, params };
+    };
+    if (opts.q && this.ftsReady && toFtsQuery(opts.q)) {
+      try {
+        const query = build(true);
+        const rows = await this.all<EventRow>(
+          `SELECT * FROM events ${query.where} ORDER BY id DESC LIMIT ?`,
+          query.params
+        );
+        return rows.map(mapEvent);
+      } catch (err) {
+        console.warn("[database] fts query failed", err);
+      }
     }
-    if (opts.before) {
-      clauses.push("received_at < ?");
-      params.push(opts.before);
-    }
-    if (opts.from) {
-      clauses.push("received_at >= ?");
-      params.push(opts.from);
-    }
-    if (opts.to) {
-      clauses.push("received_at <= ?");
-      params.push(opts.to);
-    }
-    if (opts.transport) {
-      clauses.push("transport = ?");
-      params.push(opts.transport);
-    }
-    if (opts.app) {
-      clauses.push("app_name LIKE ?");
-      params.push(`%${opts.app}%`);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    params.push(limit);
+    const query = build(false);
     const rows = await this.all<EventRow>(
-      `SELECT * FROM events ${where} ORDER BY id DESC LIMIT ?`,
-      params
+      `SELECT * FROM events ${query.where} ORDER BY id DESC LIMIT ?`,
+      query.params
     );
     return rows.map(mapEvent);
   }
@@ -371,10 +506,12 @@ export class SiemDatabase {
          AND origin = ?
          AND received_at >= ?
          AND (
-           lower(message) LIKE '%failed password%'
+           ifnull(action, '') IN ('login_failure', 'sudo_failure')
+           OR lower(message) LIKE '%failed password%'
            OR lower(message) LIKE '%invalid user%'
            OR lower(message) LIKE '%wrong password%'
            OR lower(message) LIKE '%incorrect password%'
+           OR lower(message) LIKE '%authentication failure%'
          )
          AND lower(message) NOT LIKE '%ocsp%'
          AND lower(message) NOT LIKE '%trustd%'
@@ -498,6 +635,12 @@ export class SiemDatabase {
 
   async pruneEvents(keep = 200_000, maxAgeDays = 7): Promise<number> {
     const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    try {
+      const archived = await this.archiveOlderThan(cutoff);
+      if (archived > 0) console.log(`[siem] archived ${archived} events before retention delete`);
+    } catch (err) {
+      console.warn("[siem] archive before prune failed", err);
+    }
     const old = await this.run("DELETE FROM events WHERE received_at < ?", [cutoff]);
     const overflow = await this.run(
       `DELETE FROM events WHERE id NOT IN (
@@ -506,6 +649,44 @@ export class SiemDatabase {
       [keep]
     );
     return (old.changes ?? 0) + (overflow.changes ?? 0);
+  }
+
+  async archiveOlderThan(cutoff: string): Promise<number> {
+    const first = await this.get<{ id: number }>(
+      "SELECT id FROM events WHERE received_at < ? ORDER BY id LIMIT 1",
+      [cutoff]
+    );
+    if (!first) return 0;
+    const dir = path.join(APP_SUPPORT, "archive");
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(dir, `events-${stamp}.jsonl.gz`);
+    const gzip = createGzip();
+    const out = fs.createWriteStream(file);
+    gzip.pipe(out);
+    let lastId = 0;
+    let count = 0;
+    while (true) {
+      const rows = await this.all<Record<string, unknown>>(
+        `SELECT id, received_at, event_time, hostname, app_name, user_name, src_ip,
+                category, action, transport, message
+         FROM events WHERE received_at < ? AND id > ? ORDER BY id LIMIT 2000`,
+        [cutoff, lastId]
+      );
+      if (rows.length === 0) break;
+      lastId = Number(rows[rows.length - 1].id);
+      count += rows.length;
+      const ok = gzip.write(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+      if (!ok) await once(gzip, "drain");
+    }
+    gzip.end();
+    await once(out, "finish");
+    return count;
+  }
+
+  async checkpointCopy(dest: string): Promise<void> {
+    await this.exec("PRAGMA wal_checkpoint(FULL);");
+    fs.copyFileSync(this.file, dest);
   }
 
   async expirePendingResponses(maxAgeHours = 24): Promise<number> {
@@ -520,8 +701,7 @@ export class SiemDatabase {
   }
 
   async updateIncidentStatus(id: number, status: "open" | "ack" | "closed"): Promise<Incident | null> {
-    await this.run("UPDATE incidents SET status = ? WHERE id = ?", [status, id]);
-    return this.getIncident(id);
+    return this.updateIncidentCase(id, { status });
   }
 
   async updateIncidentAi(
@@ -718,17 +898,33 @@ export class SiemDatabase {
     status: FimRecord["status"];
     origin: EventOrigin;
     previousHash?: string;
+    size?: number | null;
+    mode?: string | null;
+    mtime?: string | null;
   }): Promise<FimRecord> {
     const updatedAt = new Date().toISOString();
     await this.run(
-      `INSERT INTO fim_files (path, hash, status, previous_hash, updated_at, origin)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO fim_files (path, hash, status, previous_hash, updated_at, origin, size, mode, mtime)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(path) DO UPDATE SET
          hash = excluded.hash,
          status = excluded.status,
          previous_hash = excluded.previous_hash,
-         updated_at = excluded.updated_at`,
-      [input.path, input.hash, input.status, input.previousHash ?? null, updatedAt, input.origin]
+         updated_at = excluded.updated_at,
+         size = excluded.size,
+         mode = excluded.mode,
+         mtime = excluded.mtime`,
+      [
+        input.path,
+        input.hash,
+        input.status,
+        input.previousHash ?? null,
+        updatedAt,
+        input.origin,
+        input.size ?? null,
+        input.mode ?? null,
+        input.mtime ?? null
+      ]
     );
     const row = await this.getFimFile(input.path);
     if (!row) throw new Error("FIM upsert failed");
@@ -785,26 +981,35 @@ export class SiemDatabase {
     name: string;
     cve: string;
     title: string;
+    confidence?: "high" | "medium";
+    installedVersion?: string | null;
   }): Promise<InventoryHit> {
+    const collectedAt = new Date().toISOString();
+    const confidence = input.confidence ?? "medium";
     const existing = await this.get<{ id: number }>(
       "SELECT id FROM inventory_hits WHERE inventory_id = ? AND cve = ?",
       [input.inventoryId, input.cve]
     );
-    const collectedAt = new Date().toISOString();
     if (existing) {
+      await this.run(
+        "UPDATE inventory_hits SET confidence = ?, installed_version = ?, title = ?, collected_at = ? WHERE id = ?",
+        [confidence, input.installedVersion ?? null, input.title, collectedAt, existing.id]
+      );
       return {
         id: existing.id,
         inventoryId: input.inventoryId,
         name: input.name,
         cve: input.cve,
         title: input.title,
-        collectedAt
+        collectedAt,
+        confidence,
+        installedVersion: input.installedVersion ?? null
       };
     }
     const result = await this.run(
-      `INSERT INTO inventory_hits (inventory_id, name, cve, title, collected_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [input.inventoryId, input.name, input.cve, input.title, collectedAt]
+      `INSERT INTO inventory_hits (inventory_id, name, cve, title, collected_at, confidence, installed_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [input.inventoryId, input.name, input.cve, input.title, collectedAt, confidence, input.installedVersion ?? null]
     );
     return {
       id: result.lastID,
@@ -812,7 +1017,9 @@ export class SiemDatabase {
       name: input.name,
       cve: input.cve,
       title: input.title,
-      collectedAt
+      collectedAt,
+      confidence,
+      installedVersion: input.installedVersion ?? null
     };
   }
 
@@ -828,6 +1035,8 @@ export class SiemDatabase {
       cve: string;
       title: string;
       collected_at: string;
+      confidence?: string | null;
+      installed_version?: string | null;
     }>("SELECT * FROM inventory_hits ORDER BY id DESC LIMIT 80");
     return rows.map((row) => ({
       id: row.id,
@@ -835,7 +1044,9 @@ export class SiemDatabase {
       name: row.name,
       cve: row.cve,
       title: row.title,
-      collectedAt: row.collected_at
+      collectedAt: row.collected_at,
+      confidence: row.confidence === "high" ? "high" : "medium",
+      installedVersion: row.installed_version ?? null
     }));
   }
 
@@ -932,28 +1143,32 @@ export class SiemDatabase {
     };
   }
 
-  async listIocs(): Promise<Array<{ id: number; kind: string; value: string; note: string | null; createdAt: string }>> {
+  async listIocs(): Promise<
+    Array<{ id: number; kind: string; value: string; note: string | null; createdAt: string; expiresAt: string | null }>
+  > {
     const rows = await this.all<{
       id: number;
       kind: string;
       value: string;
       note: string | null;
       created_at: string;
+      expires_at?: string | null;
     }>("SELECT * FROM iocs ORDER BY id DESC");
     return rows.map((row) => ({
       id: row.id,
       kind: row.kind,
       value: row.value,
       note: row.note,
-      createdAt: row.created_at
+      createdAt: row.created_at,
+      expiresAt: row.expires_at ?? null
     }));
   }
 
-  async upsertIoc(kind: string, value: string, note: string | null): Promise<void> {
+  async upsertIoc(kind: string, value: string, note: string | null, expiresAt: string | null = null): Promise<void> {
     await this.run(
-      `INSERT INTO iocs (kind, value, note, created_at) VALUES (?, ?, ?, ?)
-       ON CONFLICT(value) DO UPDATE SET kind = excluded.kind, note = excluded.note`,
-      [kind, value.trim(), note, new Date().toISOString()]
+      `INSERT INTO iocs (kind, value, note, created_at, expires_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(value) DO UPDATE SET kind = excluded.kind, note = excluded.note, expires_at = excluded.expires_at`,
+      [kind, value.trim(), note, new Date().toISOString(), expiresAt]
     );
   }
 
@@ -988,7 +1203,7 @@ export class SiemDatabase {
     ]);
   }
 
-  async reportSummary(hours = 24): Promise<Record<string, unknown>> {
+  async reportSummary(hours = 24, retentionDays = 7): Promise<Record<string, unknown>> {
     const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
     const events = await this.get<{ n: number }>(
       "SELECT COUNT(*) as n FROM events WHERE received_at >= ? AND origin = 'live'",
@@ -1023,9 +1238,154 @@ export class SiemDatabase {
       bySeverity: Object.fromEntries(bySev.map((row) => [row.severity, row.n])),
       topHosts,
       byTransport,
-      retentionDays: 7,
+      retentionDays,
       hotWindowHours: 48
     };
+  }
+
+  async reportSeries(hours = 24): Promise<{
+    buckets: Array<{ hour: string; n: number }>;
+    failedUsers: Array<{ user: string; n: number }>;
+    publicSources: Array<{ ip: string; n: number }>;
+  }> {
+    const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+    const raw = await this.all<{ hour: string; n: number }>(
+      `SELECT substr(COALESCE(event_time, received_at), 1, 13) as hour, COUNT(*) as n
+       FROM events WHERE origin = 'live' AND COALESCE(event_time, received_at) >= ?
+       GROUP BY hour ORDER BY hour`,
+      [since]
+    );
+    const byHour = new Map(raw.map((row) => [row.hour, row.n]));
+    const buckets: Array<{ hour: string; n: number }> = [];
+    const start = new Date();
+    start.setMinutes(0, 0, 0);
+    for (let i = hours - 1; i >= 0; i -= 1) {
+      const stamp = new Date(start.getTime() - i * 3600 * 1000).toISOString().slice(0, 13);
+      buckets.push({ hour: stamp, n: byHour.get(stamp) ?? 0 });
+    }
+    const failedUsers = await this.all<{ user: string; n: number }>(
+      `SELECT user_name as user, COUNT(*) as n FROM events
+       WHERE origin = 'live' AND COALESCE(event_time, received_at) >= ?
+         AND action IN ('login_failure', 'sudo_failure') AND user_name IS NOT NULL
+       GROUP BY user_name ORDER BY n DESC LIMIT 8`,
+      [since]
+    );
+    const sources = await this.all<{ ip: string; n: number }>(
+      `SELECT src_ip as ip, COUNT(*) as n FROM events
+       WHERE origin = 'live' AND COALESCE(event_time, received_at) >= ? AND src_ip IS NOT NULL
+       GROUP BY src_ip ORDER BY n DESC LIMIT 40`,
+      [since]
+    );
+    const { ipScope } = await import("./enrich.js");
+    return {
+      buckets,
+      failedUsers,
+      publicSources: sources.filter((row) => ipScope(row.ip) === "public").slice(0, 8)
+    };
+  }
+
+  async countPriorSource(origin: EventOrigin, srcIp: string, beforeId: number, sinceIso: string): Promise<number> {
+    const row = await this.get<{ n: number }>(
+      `SELECT COUNT(*) as n FROM events
+       WHERE origin = ? AND src_ip = ? AND id < ? AND COALESCE(event_time, received_at) >= ?`,
+      [origin, srcIp, beforeId, sinceIso]
+    );
+    return row?.n ?? 0;
+  }
+
+  async entityView(kind: "host" | "user" | "ip", value: string, origin: EventOrigin) {
+    const column = kind === "host" ? "hostname" : kind === "user" ? "user_name" : "src_ip";
+    const events = await this.all<EventRow>(
+      `SELECT * FROM events WHERE origin = ? AND ${column} = ? ORDER BY id DESC LIMIT 80`,
+      [origin, value]
+    );
+    const span = await this.get<{ first: string | null; last: string | null; n: number }>(
+      `SELECT MIN(COALESCE(event_time, received_at)) as first,
+              MAX(COALESCE(event_time, received_at)) as last,
+              COUNT(*) as n
+       FROM events WHERE origin = ? AND ${column} = ?`,
+      [origin, value]
+    );
+    const actions = await this.all<{ action: string; n: number }>(
+      `SELECT action, COUNT(*) as n FROM events
+       WHERE origin = ? AND ${column} = ? AND action IS NOT NULL
+       GROUP BY action ORDER BY n DESC LIMIT 6`,
+      [origin, value]
+    );
+    const like = `%${value.replace(/[%_]/g, "")}%`;
+    const open = await this.get<{ n: number }>(
+      `SELECT COUNT(*) as n FROM incidents
+       WHERE origin = ? AND status = 'open' AND (title LIKE ? OR evidence LIKE ?)`,
+      [origin, like, like]
+    );
+    return {
+      kind,
+      value,
+      events: events.map(mapEvent),
+      firstSeen: span?.first ?? null,
+      lastSeen: span?.last ?? null,
+      eventCount: span?.n ?? 0,
+      openIncidents: open?.n ?? 0,
+      actions
+    };
+  }
+
+  async addCaseNote(incidentId: number, author: string, body: string): Promise<CaseNote> {
+    const createdAt = new Date().toISOString();
+    const result = await this.run(
+      "INSERT INTO case_notes (incident_id, created_at, author, body) VALUES (?, ?, ?, ?)",
+      [incidentId, createdAt, author, body]
+    );
+    return { id: result.lastID, incidentId, createdAt, author, body };
+  }
+
+  async listCaseNotes(incidentId: number): Promise<CaseNote[]> {
+    const rows = await this.all<{
+      id: number;
+      incident_id: number;
+      created_at: string;
+      author: string;
+      body: string;
+    }>("SELECT * FROM case_notes WHERE incident_id = ? ORDER BY id", [incidentId]);
+    return rows.map((row) => ({
+      id: row.id,
+      incidentId: row.incident_id,
+      createdAt: row.created_at,
+      author: row.author,
+      body: row.body
+    }));
+  }
+
+  async updateIncidentCase(
+    id: number,
+    patch: { status?: Incident["status"]; assignee?: string | null; closeReason?: string | null }
+  ): Promise<Incident | null> {
+    const current = await this.getIncident(id);
+    if (!current) return null;
+    await this.run("UPDATE incidents SET status = ?, assignee = ?, close_reason = ? WHERE id = ?", [
+      patch.status ?? current.status,
+      patch.assignee === undefined ? current.assignee ?? null : patch.assignee,
+      patch.closeReason === undefined ? current.closeReason ?? null : patch.closeReason,
+      id
+    ]);
+    return this.getIncident(id);
+  }
+
+  async listAudit(limit = 40): Promise<AuditRecord[]> {
+    const rows = await this.all<{
+      id: number;
+      created_at: string;
+      actor: string;
+      action: string;
+      detail: string | null;
+    }>("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", [Math.min(limit, 200)]);
+    return rows.map((row) => ({
+      id: row.id,
+      createdAt: row.created_at,
+      actor: row.actor,
+      action: row.action,
+      detail: row.detail
+    }));
   }
 
   close(): Promise<void> {
@@ -1050,6 +1410,11 @@ export interface EventRow {
   hash: string;
   origin?: EventOrigin;
   transport?: string;
+  event_time?: string | null;
+  user_name?: string | null;
+  src_ip?: string | null;
+  category?: string | null;
+  action?: string | null;
 }
 
 interface IncidentRow {
@@ -1067,6 +1432,8 @@ interface IncidentRow {
   origin?: EventOrigin;
   mitre?: string | null;
   occurrence_count?: number;
+  assignee?: string | null;
+  close_reason?: string | null;
 }
 
 interface NewsRow {
@@ -1095,6 +1462,7 @@ export function mapEvent(row: EventRow): LogEvent {
   return {
     id: row.id,
     receivedAt: row.received_at,
+    eventTime: row.event_time || row.received_at,
     facility: row.facility,
     severity: row.severity,
     severityLabel: syslogSeverityLabel(row.severity),
@@ -1104,6 +1472,10 @@ export function mapEvent(row: EventRow): LogEvent {
     message: row.message,
     raw: row.raw,
     sourceIp: row.source_ip,
+    srcIp: row.src_ip ?? null,
+    userName: row.user_name ?? null,
+    category: row.category ?? null,
+    action: row.action ?? null,
     parsed,
     hash: row.hash,
     origin: row.origin === "demo" ? "demo" : "live",
@@ -1132,7 +1504,9 @@ function mapIncident(row: IncidentRow): Incident {
     riskScore: row.risk_score,
     origin: row.origin === "demo" ? "demo" : "live",
     mitre: parseMitre(row.mitre),
-    occurrenceCount: row.occurrence_count ?? 1
+    occurrenceCount: row.occurrence_count ?? 1,
+    assignee: row.assignee ?? null,
+    closeReason: row.close_reason ?? null
   };
 }
 
@@ -1156,6 +1530,9 @@ function mapFim(row: {
   previous_hash: string | null;
   updated_at: string;
   origin: EventOrigin;
+  size?: number | null;
+  mode?: string | null;
+  mtime?: string | null;
 }): FimRecord {
   return {
     id: row.id,
@@ -1164,7 +1541,10 @@ function mapFim(row: {
     status: row.status,
     previousHash: row.previous_hash,
     updatedAt: row.updated_at,
-    origin: row.origin
+    origin: row.origin,
+    size: row.size ?? null,
+    mode: row.mode ?? null,
+    mtime: row.mtime ?? null
   };
 }
 
@@ -1227,4 +1607,10 @@ export function syslogSeverityLabel(severity: number | null): SeverityLabel {
 
 export function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function strField(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return null;
 }
