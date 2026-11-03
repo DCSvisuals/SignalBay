@@ -12,3 +12,4 @@ Dashboard: http://127.0.0.1:5173
 API: http://127.0.0.1:3001
 
 Events, models, and settings stay in `~/Library/Application Support/LocalSIEM`. The packet-filter anchor name is `localsiem`.
+
